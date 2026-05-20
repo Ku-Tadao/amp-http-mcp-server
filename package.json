@@ -1,0 +1,28 @@
+{
+  "name": "amp-http-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP server for AMP's HTTP API, generated from a captured GetAPISpec response.",
+  "main": "dist/server.js",
+  "bin": {
+    "amp-http-mcp": "dist/server.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/server.ts",
+    "start": "node dist/server.js",
+    "test": "npm run build && node dist/server.js --self-test"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "tsx": "^4.22.3",
+    "typescript": "^6.0.3"
+  }
+}
