@@ -47,6 +47,7 @@ let sessionId = process.env.AMP_SESSION_ID ?? "";
 let cachedSpec: AmpSpec = fallbackSpec as AmpSpec;
 let policyEnabled = process.env.AMP_POLICY_ENABLED !== "false";
 let policyGroup = process.env.AMP_POLICY_GROUP ?? "AI";
+let envLoginAttempted = false;
 
 function loadEnvFile(filePath: string) {
   if (!existsSync(filePath)) return;
@@ -120,10 +121,11 @@ function methodMeta(moduleName: string, methodName: string) {
 }
 
 function coerceValue(parameter: AmpParameter, value: unknown) {
-  if (value === undefined || value === null || value === "") {
+  if (value === undefined || value === null) {
     if (parameter.Optional) return undefined;
     throw new Error(`Missing required parameter "${parameter.Name}" (${parameter.TypeName}).`);
   }
+  if (value === "" && parameter.Optional) return undefined;
 
   switch (parameter.TypeName) {
     case "Boolean":
@@ -162,7 +164,37 @@ function requiresConfirmation(moduleName: string, methodName: string) {
   );
 }
 
+function shouldSkipEnvLogin(moduleName: string, methodName: string) {
+  const name = `${moduleName}/${methodName}`.toLowerCase();
+  return (
+    Boolean(sessionId) ||
+    name === "core/login" ||
+    name === "core/getauthenticationrequirements" ||
+    name === "core/getwebauthncredentialids" ||
+    name === "core/getoidcloginurl" ||
+    name === "core/oidclogin"
+  );
+}
+
+async function ensureSession(moduleName: string, methodName: string) {
+  if (shouldSkipEnvLogin(moduleName, methodName) || envLoginAttempted) return;
+
+  const username = process.env.AMP_USERNAME;
+  const password = process.env.AMP_PASSWORD;
+  if (!username || !password) return;
+
+  envLoginAttempted = true;
+  await ampRequest("Core", "Login", {
+    username,
+    password,
+    token: process.env.AMP_TOKEN ?? "",
+    rememberMe: process.env.AMP_REMEMBER_ME === "true",
+  });
+}
+
 async function ampRequest(moduleName: string, methodName: string, params: Record<string, unknown> = {}) {
+  await ensureSession(moduleName, methodName);
+
   const url = `${baseUrl}/API/${encodeURIComponent(moduleName)}/${encodeURIComponent(methodName)}`;
   const body = { ...params, SESSIONID: sessionId };
   const response = await fetch(url, {
