@@ -109,7 +109,8 @@ When the MCP policy is enabled:
 
 - ADS create calls are forced into `Group` / `DisplayGroup` matching `AMP_POLICY_GROUP`.
 - Existing-instance ADS calls are blocked unless the target instance is currently in that display group.
-- File-manager calls are blocked unless the current AMP instance itself is in the policy group.
+- After `ADSModule/ManageInstance`, instance module calls such as `FileManagerPlugin/*` are routed through AMP's controller proxy path: `/API/ADSModule/Servers/{instanceId}/API/{Module}/{Method}`.
+- File-manager calls are blocked unless the managed AMP instance is in the policy group.
 
 This policy is a guardrail in this MCP server. It is not a replacement for AMP permissions. You should still use least-privilege AMP roles because anyone with direct API access can bypass this wrapper.
 

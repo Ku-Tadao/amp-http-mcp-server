@@ -48,6 +48,8 @@ let cachedSpec: AmpSpec = fallbackSpec as AmpSpec;
 let policyEnabled = process.env.AMP_POLICY_ENABLED !== "false";
 let policyGroup = process.env.AMP_POLICY_GROUP ?? "AI";
 let envLoginAttempted = false;
+let managedInstance: AmpInstance | null = null;
+let managedSessionId = "";
 
 function loadEnvFile(filePath: string) {
   if (!existsSync(filePath)) return;
@@ -192,7 +194,73 @@ async function ensureSession(moduleName: string, methodName: string) {
   });
 }
 
-async function ampRequest(moduleName: string, methodName: string, params: Record<string, unknown> = {}) {
+function instanceIdOf(instance: AmpInstance | null) {
+  return instance?.InstanceID ?? instance?.InstanceId ?? "";
+}
+
+async function ensureManagedSession(instance: AmpInstance) {
+  if (managedSessionId) return;
+
+  const username = process.env.AMP_USERNAME;
+  const password = process.env.AMP_PASSWORD;
+  if (!username || !password) {
+    throw new Error("Managed instance API calls require AMP_USERNAME and AMP_PASSWORD.");
+  }
+
+  await ampRequest("Core", "Login", {
+    username,
+    password,
+    token: process.env.AMP_TOKEN ?? "",
+    rememberMe: false,
+  }, instance);
+}
+
+async function ampRequest(
+  moduleName: string,
+  methodName: string,
+  params: Record<string, unknown> = {},
+  instance: AmpInstance | null = null,
+) {
+  if (instance) {
+    const id = instanceIdOf(instance);
+    if (!id) throw new Error("Cannot make managed instance request without an instance ID.");
+    if (methodName !== "Login") await ensureManagedSession(instance);
+
+    const url = `${baseUrl}/API/ADSModule/Servers/${encodeURIComponent(id)}/API/${encodeURIComponent(moduleName)}/${encodeURIComponent(methodName)}`;
+    const body = { ...params, SESSIONID: managedSessionId };
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": `Bearer ${managedSessionId || sessionId}`,
+      },
+      body: JSON.stringify(body),
+    });
+
+    const authHeader = response.headers.get("Authorization");
+    const text = await response.text();
+    let data: unknown = text;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = text;
+    }
+
+    if (authHeader?.startsWith("Bearer ")) {
+      managedSessionId = authHeader.slice("Bearer ".length);
+    }
+    if (data && typeof data === "object" && "sessionID" in data && typeof data.sessionID === "string") {
+      managedSessionId = data.sessionID;
+    }
+
+    if (!response.ok) {
+      throw new Error(`AMP HTTP ${response.status}: ${text}`);
+    }
+
+    return data;
+  }
+
   await ensureSession(moduleName, methodName);
 
   const url = `${baseUrl}/API/${encodeURIComponent(moduleName)}/${encodeURIComponent(methodName)}`;
@@ -230,6 +298,21 @@ async function ampRequest(moduleName: string, methodName: string, params: Record
   return data;
 }
 
+function isAmpError(value: unknown) {
+  return Boolean(
+    value &&
+      typeof value === "object" &&
+      ("Title" in value || "title" in value) &&
+      ("Message" in value || "message" in value)
+  );
+}
+
+function getAmpErrorMessage(value: unknown) {
+  if (!value || typeof value !== "object") return "";
+  const record = value as Record<string, unknown>;
+  return String(record.Message ?? record.message ?? "");
+}
+
 function asArray(value: unknown): unknown[] {
   return Array.isArray(value) ? value : [];
 }
@@ -261,7 +344,13 @@ async function assertPolicyAllows(moduleName: string, methodName: string, params
 
   const callName = `${moduleName}/${methodName}`.toLowerCase();
   if (moduleName === "FileManagerPlugin") {
-    const moduleInfo = await ampRequest("Core", "GetModuleInfo");
+    if (!managedInstance) {
+      throw new Error(
+        `Policy blocked ${moduleName}/${methodName}: call ADSModule/ManageInstance for an instance in display group "${policyGroup}" first.`,
+      );
+    }
+
+    const moduleInfo = await ampRequest("Core", "GetModuleInfo", {}, managedInstance);
     const currentInstanceId =
       moduleInfo && typeof moduleInfo === "object" && "InstanceId" in moduleInfo
         ? String(moduleInfo.InstanceId)
@@ -273,6 +362,11 @@ async function assertPolicyAllows(moduleName: string, methodName: string, params
     });
 
     if (!allowed) {
+      if (managedInstance) {
+        throw new Error(
+          `Policy blocked ${moduleName}/${methodName}: AMP returned a management handoff for "${managedInstance.InstanceName}", but the controller API did not switch into a usable instance session. Direct/proxied instance API access is required before file-manager calls can be made safely.`,
+        );
+      }
       throw new Error(
         `Policy blocked ${moduleName}/${methodName}: file-manager calls are only allowed on instances in display group "${policyGroup}".`,
       );
@@ -309,6 +403,28 @@ async function assertPolicyAllows(moduleName: string, methodName: string, params
   }
 
   return params;
+}
+
+async function updateManagedInstance(moduleName: string, methodName: string, params: Record<string, unknown>, result: unknown) {
+  if (moduleName !== "ADSModule" || methodName !== "ManageInstance" || isAmpError(result)) return;
+  if (!result || typeof result !== "object" || !("Status" in result) || (result as { Status?: unknown }).Status !== true) {
+    managedInstance = null;
+    managedSessionId = "";
+    return;
+  }
+
+  const targetId = getParam(params, "InstanceID", "InstanceId", "instanceId");
+  const targetName = getParam(params, "InstanceName", "instanceName");
+  const policyInstances = await getPolicyInstances();
+  managedInstance =
+    policyInstances.find((instance) => {
+      const id = instance.InstanceID ?? instance.InstanceId;
+      return (
+        (targetId && String(id).toLowerCase() === String(targetId).toLowerCase()) ||
+        (targetName && String(instance.InstanceName).toLowerCase() === String(targetName).toLowerCase())
+      );
+    }) ?? null;
+  managedSessionId = "";
 }
 
 server.registerTool(
@@ -431,6 +547,8 @@ server.registerTool(
   },
   async () => {
     sessionId = "";
+    managedInstance = null;
+    managedSessionId = "";
     return textResult({ baseUrl, hasSession: false });
   },
 );
@@ -453,7 +571,15 @@ server.registerTool(
     }
     const body = normalizeParams(meta, params ?? {});
     const policyBody = await assertPolicyAllows(moduleName, methodName, body);
-    return textResult(await ampRequest(moduleName, methodName, policyBody));
+    const useManagedRoute = Boolean(managedInstance && moduleName !== "ADSModule");
+    const result = await ampRequest(moduleName, methodName, policyBody, useManagedRoute ? managedInstance : null);
+    await updateManagedInstance(moduleName, methodName, policyBody, result);
+    if (isAmpError(result)) {
+      throw new Error(
+        `AMP rejected ${moduleName}/${methodName}: ${getAmpErrorMessage(result)}`,
+      );
+    }
+    return textResult(result);
   },
 );
 
