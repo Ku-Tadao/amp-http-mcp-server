@@ -2,7 +2,7 @@
 
 An MCP server for the CubeCoders AMP HTTP API.
 
-AMP exposes a machine-readable API catalog through `Core/GetAPISpec`. This server uses that catalog shape to provide a small, generic MCP bridge for logging in, discovering available methods, and calling AMP API methods from an MCP client.
+AMP exposes a machine-readable API catalog through `Core/GetAPISpec`. This server provides a friendly MCP layer for common AMP operations such as listing instances, selecting a server, starting/stopping it, reading/writing files, and sending console commands. It also keeps a raw `amp_call` escape hatch for advanced API methods.
 
 ## How AMP Calls Work
 
@@ -81,6 +81,31 @@ You can also provide `AMP_SESSION_ID`, but `amp_login` or `amp_login_from_env` i
 
 ## Tools
 
+Friendly day-to-day tools:
+
+- `amp_instances`: list instances in the configured policy group
+- `amp_status`: show status for one instance, the selected instance, or all allowed instances
+- `amp_use_instance`: select an instance by name, friendly name, or ID
+- `amp_start_instance`: start an allowed instance
+- `amp_stop_instance`: stop an allowed instance
+- `amp_restart_instance`: restart an allowed instance, or start it if it is stopped
+- `amp_files_list`: list a directory through AMP File Manager
+- `amp_file_read`: read a file through AMP File Manager
+- `amp_file_write`: overwrite a file through AMP File Manager
+- `amp_file_append`: append to a file through AMP File Manager
+- `amp_file_rename`: rename a file through AMP File Manager
+- `amp_file_copy`: copy a file into another directory
+- `amp_file_trash`: move a file to AMP trash
+- `amp_directory_create`: create a directory
+- `amp_directory_rename`: rename a directory
+- `amp_directory_trash`: move a directory to AMP trash
+- `amp_console_read`: read recent console/status updates from the selected instance
+- `amp_console_send`: send console input to the selected instance
+- `amp_supported_apps`: list AMP application modules available for new instances
+- `amp_create_instance`: create a new auto-configured instance in the policy group
+
+Setup and escape-hatch tools:
+
 - `amp_configure`: set base URL, optional session ID, and policy options
 - `amp_api_spec`: view the bundled spec or refresh live from AMP
 - `amp_module_info`: call `Core/GetModuleInfo`
@@ -88,10 +113,96 @@ You can also provide `AMP_SESSION_ID`, but `amp_login` or `amp_login_from_env` i
 - `amp_auth_requirements`: call `Core/GetAuthenticationRequirements`
 - `amp_login`: call `Core/Login` with explicit credentials
 - `amp_login_from_env`: call `Core/Login` using `.env` credentials
-- `amp_clear_session`: forget the stored AMP session
+- `amp_clear_session`: forget stored controller and managed-instance sessions
 - `amp_call`: call any method in the loaded AMP API spec
 
 State-changing calls through `amp_call` require `confirm: true`.
+
+## Friendly Workflows
+
+List the instances the MCP is allowed to touch:
+
+```json
+{}
+```
+
+with `amp_instances`.
+
+Select one by a unique partial name:
+
+```json
+{
+  "instance": "rust",
+  "startIfStopped": true
+}
+```
+
+with `amp_use_instance`.
+
+List a folder:
+
+```json
+{
+  "path": "oxide/plugins"
+}
+```
+
+with `amp_files_list`.
+
+Read a plugin:
+
+```json
+{
+  "path": "oxide/plugins/MyPlugin.cs"
+}
+```
+
+with `amp_file_read`.
+
+Write a file:
+
+```json
+{
+  "path": "oxide/plugins/Example.cs",
+  "content": "using Oxide.Core;\n"
+}
+```
+
+with `amp_file_write`.
+
+Move a file to trash:
+
+```json
+{
+  "path": "oxide/plugins/OldExample.cs"
+}
+```
+
+with `amp_file_trash`.
+
+Send a console command:
+
+```json
+{
+  "message": "status"
+}
+```
+
+with `amp_console_send`.
+
+The file and console tools default to `startIfStopped: true` because AMP's managed instance APIs usually need the instance to be running before File Manager and console calls work. Pass `startIfStopped: false` when you only want to operate on already-running instances.
+
+To create a new instance, first inspect modules with `amp_supported_apps`, then call `amp_create_instance`:
+
+```json
+{
+  "module": "Rust",
+  "friendlyName": "AI Test Rust",
+  "autoConfigure": true
+}
+```
+
+The MCP policy forces created instances into `AMP_POLICY_GROUP`.
 
 ## Safety Model
 
@@ -111,6 +222,8 @@ When the MCP policy is enabled:
 - Existing-instance ADS calls are blocked unless the target instance is currently in that display group.
 - After `ADSModule/ManageInstance`, instance module calls such as `FileManagerPlugin/*` are routed through AMP's controller proxy path: `/API/ADSModule/Servers/{instanceId}/API/{Module}/{Method}`.
 - File-manager calls are blocked unless the managed AMP instance is in the policy group.
+- Friendly tools resolve instance names only from the policy group. If a name matches multiple instances, the tool refuses to guess.
+- Managed instance login is retried for a short period after start/restart so clients can use simple one-step flows.
 
 This policy is a guardrail in this MCP server. It is not a replacement for AMP permissions. You should still use least-privilege AMP roles because anyone with direct API access can bypass this wrapper.
 
@@ -124,6 +237,7 @@ For safer operation:
 - use a dedicated display group and keep `AMP_POLICY_ENABLED=true`
 - do not expose this MCP server to untrusted clients
 - rotate the automation password/session if you accidentally run it with an administrator account
+- keep `.env`, HAR files, `dist`, and `node_modules` out of Git
 
 ## Refreshing The API Spec
 

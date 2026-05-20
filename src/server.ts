@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -31,7 +32,12 @@ type AmpInstance = {
   InstanceName?: string;
   FriendlyName?: string;
   Group?: string;
+  Module?: string;
+  Port?: number;
+  Running?: boolean;
+  [key: string]: unknown;
 };
+type AmpRecord = Record<string, unknown>;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
@@ -50,6 +56,12 @@ let policyGroup = process.env.AMP_POLICY_GROUP ?? "AI";
 let envLoginAttempted = false;
 let managedInstance: AmpInstance | null = null;
 let managedSessionId = "";
+
+const defaultWaitTimeoutMs = Number(process.env.AMP_WAIT_TIMEOUT_MS ?? 120000);
+const defaultPollMs = Number(process.env.AMP_POLL_MS ?? 3000);
+const defaultManagedLoginTimeoutMs = Number(process.env.AMP_MANAGED_LOGIN_TIMEOUT_MS ?? 90000);
+const defaultFileChunkBytes = Number(process.env.AMP_FILE_CHUNK_BYTES ?? 524288);
+const defaultMaxReadBytes = Number(process.env.AMP_MAX_READ_BYTES ?? 1048576);
 
 function loadEnvFile(filePath: string) {
   if (!existsSync(filePath)) return;
@@ -198,7 +210,7 @@ function instanceIdOf(instance: AmpInstance | null) {
   return instance?.InstanceID ?? instance?.InstanceId ?? "";
 }
 
-async function ensureManagedSession(instance: AmpInstance) {
+async function ensureManagedSession(instance: AmpInstance, timeoutMs = defaultManagedLoginTimeoutMs) {
   if (managedSessionId) return;
 
   const username = process.env.AMP_USERNAME;
@@ -207,12 +219,25 @@ async function ensureManagedSession(instance: AmpInstance) {
     throw new Error("Managed instance API calls require AMP_USERNAME and AMP_PASSWORD.");
   }
 
-  await ampRequest("Core", "Login", {
-    username,
-    password,
-    token: process.env.AMP_TOKEN ?? "",
-    rememberMe: false,
-  }, instance);
+  const deadline = Date.now() + timeoutMs;
+  let lastError = "";
+
+  while (Date.now() <= deadline) {
+    const result = await ampRequest("Core", "Login", {
+      username,
+      password,
+      token: process.env.AMP_TOKEN ?? "",
+      rememberMe: false,
+    }, instance);
+
+    if (!isAmpError(result) && !isActionFailure(result) && managedSessionId) return;
+
+    lastError = getAmpErrorMessage(result) || actionMessage(result) || JSON.stringify(redact(result));
+    await sleep(defaultPollMs);
+  }
+
+  const name = instance.FriendlyName ?? instance.InstanceName ?? instanceIdOf(instance);
+  throw new Error(`Could not log in to managed AMP instance "${name}" within ${timeoutMs}ms. Last response: ${lastError}`);
 }
 
 async function ampRequest(
@@ -313,8 +338,47 @@ function getAmpErrorMessage(value: unknown) {
   return String(record.Message ?? record.message ?? "");
 }
 
+function asRecord(value: unknown): AmpRecord | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as AmpRecord) : null;
+}
+
+function isActionFailure(value: unknown) {
+  const record = asRecord(value);
+  return record?.Status === false || record?.status === false;
+}
+
+function actionMessage(value: unknown) {
+  const record = asRecord(value);
+  if (!record) return "";
+  return String(
+    record.Reason ??
+      record.reason ??
+      record.Message ??
+      record.message ??
+      record.Title ??
+      record.title ??
+      "",
+  );
+}
+
+function actionResultValue(value: unknown) {
+  const record = asRecord(value);
+  return record && "Result" in record ? record.Result : value;
+}
+
+function assertAmpAccepted(context: string, value: unknown) {
+  if (isAmpError(value) || isActionFailure(value)) {
+    const message = getAmpErrorMessage(value) || actionMessage(value) || "AMP returned an error.";
+    throw new Error(`AMP rejected ${context}: ${message}`);
+  }
+}
+
 function asArray(value: unknown): unknown[] {
   return Array.isArray(value) ? value : [];
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function getKnownInstances() {
@@ -425,6 +489,430 @@ async function updateManagedInstance(moduleName: string, methodName: string, par
       );
     }) ?? null;
   managedSessionId = "";
+}
+
+function instanceLabel(instance: AmpInstance | null) {
+  if (!instance) return null;
+  return instance.FriendlyName ?? instance.InstanceName ?? instanceIdOf(instance);
+}
+
+function instanceNameOrThrow(instance: AmpInstance) {
+  if (!instance.InstanceName) {
+    throw new Error(`Instance "${instanceLabel(instance)}" does not expose an InstanceName.`);
+  }
+  return instance.InstanceName;
+}
+
+function matchFields(instance: AmpInstance) {
+  return [instanceIdOf(instance), instance.InstanceName, instance.FriendlyName]
+    .filter((value): value is string => typeof value === "string" && value.length > 0);
+}
+
+function sameInstance(left: AmpInstance, right: AmpInstance) {
+  const leftId = instanceIdOf(left).toLowerCase();
+  const rightId = instanceIdOf(right).toLowerCase();
+  if (leftId && rightId) return leftId === rightId;
+  return String(left.InstanceName ?? "").toLowerCase() === String(right.InstanceName ?? "").toLowerCase();
+}
+
+function pickString(record: AmpRecord | null | undefined, ...keys: string[]) {
+  if (!record) return undefined;
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string" && value.length > 0) return value;
+    if (typeof value === "number" || typeof value === "boolean") return String(value);
+  }
+  return undefined;
+}
+
+function pickNumber(record: AmpRecord | null | undefined, ...keys: string[]) {
+  if (!record) return undefined;
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string" && /^-?\d+$/.test(value)) return Number(value);
+  }
+  return undefined;
+}
+
+function runningFromRecord(record: AmpRecord | null | undefined) {
+  if (!record) return undefined;
+  for (const key of ["Running", "IsRunning", "Started", "IsStarted"]) {
+    const value = record[key];
+    if (typeof value === "boolean") return value;
+  }
+
+  const state = pickString(record, "State", "Status", "AppState", "ApplicationState", "DaemonState")?.toLowerCase();
+  if (!state) return undefined;
+  if (/(stopped|offline|not running|notrunning|failed|unavailable)/.test(state)) return false;
+  if (/(running|ready|idle|starting|updating|online|available)/.test(state)) return true;
+  return undefined;
+}
+
+function isInstanceRunning(instance: AmpInstance, status?: AmpRecord | null) {
+  return runningFromRecord(status) ?? runningFromRecord(instance);
+}
+
+async function getInstanceStatuses() {
+  const response = await ampRequest("ADSModule", "GetInstanceStatuses");
+  return asArray(response).flatMap((status) => {
+    const record = asRecord(status);
+    return record ? [record] : [];
+  });
+}
+
+async function tryGetInstanceStatuses() {
+  try {
+    return { statuses: await getInstanceStatuses(), error: "" };
+  } catch (error) {
+    return { statuses: [] as AmpRecord[], error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function statusMatchesInstance(status: AmpRecord, instance: AmpInstance) {
+  const statusId = pickString(status, "InstanceID", "InstanceId", "Id", "ID", "instanceId")?.toLowerCase();
+  const instanceId = instanceIdOf(instance).toLowerCase();
+  if (statusId && instanceId && statusId === instanceId) return true;
+
+  const statusName = pickString(status, "InstanceName", "Name", "Instance", "instanceName")?.toLowerCase();
+  const instanceName = String(instance.InstanceName ?? "").toLowerCase();
+  return Boolean(statusName && instanceName && statusName === instanceName);
+}
+
+function findStatusForInstance(statuses: AmpRecord[], instance: AmpInstance) {
+  return statuses.find((status) => statusMatchesInstance(status, instance)) ?? null;
+}
+
+function summarizeInstance(instance: AmpInstance, status?: AmpRecord | null, includeRaw = false) {
+  const instanceRecord = asRecord(instance) ?? {};
+  const summary: AmpRecord = {
+    id: instanceIdOf(instance),
+    instanceName: instance.InstanceName ?? null,
+    friendlyName: instance.FriendlyName ?? null,
+    module: pickString(instanceRecord, "Module", "ModuleName", "AppModule") ?? null,
+    group: instance.Group ?? null,
+    port: pickNumber(status, "Port", "PortNumber", "ApplicationPort") ?? pickNumber(instanceRecord, "Port", "PortNumber") ?? null,
+    running: isInstanceRunning(instance, status) ?? null,
+    state: pickString(status, "State", "Status", "AppState", "ApplicationState") ?? null,
+  };
+
+  if (includeRaw) {
+    summary.instance = instance;
+    summary.status = status ?? null;
+  }
+
+  return summary;
+}
+
+async function summarizePolicyInstances(includeRaw = false) {
+  const instances = await getPolicyInstances();
+  const { statuses, error } = await tryGetInstanceStatuses();
+  return {
+    policyEnabled,
+    policyGroup,
+    selected: instanceLabel(managedInstance),
+    statusError: error || undefined,
+    instances: instances.map((instance) => summarizeInstance(instance, findStatusForInstance(statuses, instance), includeRaw)),
+  };
+}
+
+async function resolvePolicyInstance(query?: string, allowCurrent = true) {
+  const instances = await getPolicyInstances();
+  if (instances.length === 0) {
+    throw new Error(`No instances are visible in display group "${policyGroup}".`);
+  }
+
+  const needle = query?.trim().toLowerCase();
+  if (!needle) {
+    if (allowCurrent && managedInstance) {
+      const current = instances.find((instance) => sameInstance(instance, managedInstance as AmpInstance));
+      if (current) return current;
+    }
+    if (instances.length === 1) return instances[0];
+    throw new Error(
+      `Pick an instance by name, friendly name, or ID. Allowed instances: ${instances.map((instance) => instanceLabel(instance)).join(", ")}`,
+    );
+  }
+
+  const exact = instances.filter((instance) => matchFields(instance).some((field) => field.toLowerCase() === needle));
+  if (exact.length === 1) return exact[0];
+  if (exact.length > 1) {
+    throw new Error(`More than one instance exactly matched "${query}": ${exact.map((instance) => instanceLabel(instance)).join(", ")}`);
+  }
+
+  const partial = instances.filter((instance) => matchFields(instance).some((field) => field.toLowerCase().includes(needle)));
+  if (partial.length === 1) return partial[0];
+  if (partial.length > 1) {
+    throw new Error(`More than one instance matched "${query}": ${partial.map((instance) => instanceLabel(instance)).join(", ")}`);
+  }
+
+  throw new Error(
+    `No instance in display group "${policyGroup}" matched "${query}". Allowed instances: ${instances.map((instance) => instanceLabel(instance)).join(", ")}`,
+  );
+}
+
+async function callAdsMethod(methodName: string, params: Record<string, unknown>) {
+  const policyBody = await assertPolicyAllows("ADSModule", methodName, params);
+  const result = await ampRequest("ADSModule", methodName, policyBody);
+  await updateManagedInstance("ADSModule", methodName, policyBody, result);
+  assertAmpAccepted(`ADSModule/${methodName}`, result);
+  return result;
+}
+
+async function callManagedMethod(
+  instance: AmpInstance,
+  moduleName: string,
+  methodName: string,
+  params: Record<string, unknown> = {},
+) {
+  const policyBody = await assertPolicyAllows(moduleName, methodName, params);
+  const result = await ampRequest(moduleName, methodName, policyBody, instance);
+  assertAmpAccepted(`${moduleName}/${methodName}`, result);
+  return result;
+}
+
+async function waitForInstanceState(instance: AmpInstance, desiredRunning: boolean, timeoutMs = defaultWaitTimeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let latest = summarizeInstance(instance);
+
+  while (Date.now() <= deadline) {
+    const statuses = await getInstanceStatuses();
+    const status = findStatusForInstance(statuses, instance);
+    latest = summarizeInstance(instance, status);
+    if (latest.running === desiredRunning) return latest;
+    await sleep(defaultPollMs);
+  }
+
+  throw new Error(
+    `Timed out waiting for "${instanceLabel(instance)}" to become ${desiredRunning ? "running" : "stopped"}. Last status: ${JSON.stringify(latest)}`,
+  );
+}
+
+async function statusForInstance(instance: AmpInstance) {
+  const { statuses } = await tryGetInstanceStatuses();
+  return summarizeInstance(instance, findStatusForInstance(statuses, instance));
+}
+
+async function startPolicyInstance(instance: AmpInstance, wait = true, timeoutMs = defaultWaitTimeoutMs) {
+  const before = await statusForInstance(instance);
+  if (before.running === true) return { alreadyRunning: true, status: before };
+
+  const result = await callAdsMethod("StartInstance", { InstanceName: instanceNameOrThrow(instance) });
+  if (!wait) return { alreadyRunning: false, result, status: await statusForInstance(instance) };
+  return { alreadyRunning: false, result, status: await waitForInstanceState(instance, true, timeoutMs) };
+}
+
+async function stopPolicyInstance(instance: AmpInstance, wait = true, timeoutMs = defaultWaitTimeoutMs) {
+  const before = await statusForInstance(instance);
+  if (before.running === false) return { alreadyStopped: true, status: before };
+
+  const result = await callAdsMethod("StopInstance", { InstanceName: instanceNameOrThrow(instance) });
+  if (!wait) return { alreadyStopped: false, result, status: await statusForInstance(instance) };
+  return { alreadyStopped: false, result, status: await waitForInstanceState(instance, false, timeoutMs) };
+}
+
+function shouldRetryManageAfterStart(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /(unavailable|not running|notrunning|stopped|offline|could not be contacted|connect)/i.test(message);
+}
+
+async function ensureManagedInstance(
+  instance: AmpInstance,
+  options: { startIfStopped?: boolean; waitTimeoutMs?: number } = {},
+) {
+  const waitTimeoutMs = options.waitTimeoutMs ?? defaultWaitTimeoutMs;
+  let started = false;
+
+  const status = await statusForInstance(instance);
+  if (status.running === false && options.startIfStopped) {
+    await startPolicyInstance(instance, true, waitTimeoutMs);
+    started = true;
+  }
+
+  try {
+    const result = await callAdsMethod("ManageInstance", { InstanceId: instanceIdOf(instance) });
+    managedInstance ??= instance;
+    await ensureManagedSession(managedInstance, waitTimeoutMs);
+    return { instance: managedInstance, started, manageResult: result, status: await statusForInstance(managedInstance) };
+  } catch (error) {
+    if (!options.startIfStopped || !shouldRetryManageAfterStart(error)) throw error;
+    await startPolicyInstance(instance, true, waitTimeoutMs);
+    started = true;
+    const result = await callAdsMethod("ManageInstance", { InstanceId: instanceIdOf(instance) });
+    managedInstance ??= instance;
+    await ensureManagedSession(managedInstance, waitTimeoutMs);
+    return { instance: managedInstance, started, manageResult: result, status: await statusForInstance(managedInstance) };
+  }
+}
+
+async function managedInstanceFor(query?: string, startIfStopped = true, waitTimeoutMs = defaultWaitTimeoutMs) {
+  const instance = await resolvePolicyInstance(query, true);
+  const ready = await ensureManagedInstance(instance, { startIfStopped, waitTimeoutMs });
+  return ready.instance;
+}
+
+function normalizeAmpPath(value: string | undefined, fallback = ".") {
+  const normalized = (value?.trim() || fallback).replace(/\\/g, "/").replace(/^\/+/, "");
+  return normalized || fallback;
+}
+
+function splitAmpPath(filePath: string) {
+  const filename = normalizeAmpPath(filePath);
+  const separator = filename.lastIndexOf("/");
+  if (separator === -1) return { dir: ".", name: filename };
+  return { dir: filename.slice(0, separator) || ".", name: filename.slice(separator + 1) };
+}
+
+function fileEntryName(entry: AmpRecord) {
+  return pickString(entry, "Name", "Filename", "FileName", "DisplayName", "FullName") ?? "";
+}
+
+function fileEntrySize(entry: AmpRecord) {
+  return pickNumber(entry, "SizeBytes", "Size", "FileSize", "Length", "Bytes");
+}
+
+async function listDirectory(instance: AmpInstance, dir: string) {
+  const normalizedDir = normalizeAmpPath(dir);
+  const result = await callManagedMethod(instance, "FileManagerPlugin", "GetDirectoryListing", { Dir: normalizedDir });
+  return { path: normalizedDir, entries: asArray(result) };
+}
+
+async function findFileSize(instance: AmpInstance, filePath: string) {
+  const { dir, name } = splitAmpPath(filePath);
+  try {
+    const listing = await listDirectory(instance, dir);
+    const match = listing.entries
+      .flatMap((entry) => {
+        const record = asRecord(entry);
+        return record ? [record] : [];
+      })
+      .find((entry) => fileEntryName(entry).toLowerCase() === name.toLowerCase());
+    return match ? fileEntrySize(match) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function chunkToBuffer(result: unknown) {
+  const encoded = actionResultValue(result);
+  if (typeof encoded !== "string") {
+    throw new Error(`AMP returned an unexpected file chunk: ${JSON.stringify(redact(result))}`);
+  }
+  return Buffer.from(encoded, "base64");
+}
+
+async function readFileContent(instance: AmpInstance, filePath: string, maxBytes = defaultMaxReadBytes, chunkSize = defaultFileChunkBytes) {
+  const filename = normalizeAmpPath(filePath);
+  const size = await findFileSize(instance, filename);
+  const chunks: Buffer[] = [];
+  let offset = 0;
+  let truncated = false;
+
+  while (offset < maxBytes) {
+    const requested = Math.min(chunkSize, maxBytes - offset);
+    const result = await callManagedMethod(instance, "FileManagerPlugin", "ReadFileChunk", {
+      Filename: filename,
+      Offset: offset,
+      ChunkSize: requested,
+    });
+    const buffer = chunkToBuffer(result);
+    chunks.push(buffer);
+    offset += buffer.length;
+
+    if (buffer.length === 0 || buffer.length < requested) break;
+    if (size !== undefined && offset >= size) break;
+  }
+
+  if (size !== undefined && offset < size) truncated = true;
+  if (size === undefined && offset >= maxBytes) truncated = true;
+
+  return { filename, bytesRead: offset, sizeBytes: size ?? null, truncated, buffer: Buffer.concat(chunks) };
+}
+
+async function writeFileContent(instance: AmpInstance, filePath: string, content: string, encoding: "utf8" | "base64", chunkSize = defaultFileChunkBytes) {
+  const filename = normalizeAmpPath(filePath);
+  const buffer = encoding === "base64" ? Buffer.from(content, "base64") : Buffer.from(content, "utf8");
+
+  if (buffer.length === 0) {
+    const result = await callManagedMethod(instance, "FileManagerPlugin", "WriteFileChunk", {
+      Filename: filename,
+      Data: "",
+      Offset: 0,
+      FinalChunk: true,
+    });
+    return { filename, bytesWritten: 0, result };
+  }
+
+  let offset = 0;
+  let lastResult: unknown = null;
+  while (offset < buffer.length) {
+    const nextOffset = Math.min(offset + chunkSize, buffer.length);
+    const chunk = buffer.subarray(offset, nextOffset);
+    lastResult = await callManagedMethod(instance, "FileManagerPlugin", "WriteFileChunk", {
+      Filename: filename,
+      Data: chunk.toString("base64"),
+      Offset: offset,
+      FinalChunk: nextOffset >= buffer.length,
+    });
+    offset = nextOffset;
+  }
+
+  return { filename, bytesWritten: buffer.length, result: lastResult };
+}
+
+async function appendFileContent(instance: AmpInstance, filePath: string, content: string, encoding: "utf8" | "base64") {
+  const filename = normalizeAmpPath(filePath);
+  const buffer = encoding === "base64" ? Buffer.from(content, "base64") : Buffer.from(content, "utf8");
+  const result = await callManagedMethod(instance, "FileManagerPlugin", "AppendFileChunk", {
+    Filename: filename,
+    Data: buffer.toString("base64"),
+    Delete: false,
+  });
+  return { filename, bytesAppended: buffer.length, result };
+}
+
+const postCreateActions: Record<string, number> = {
+  DoNothing: 0,
+  UpdateOnce: 1,
+  UpdateAlways: 2,
+  UpdateAndStartOnce: 3,
+  UpdateAndStartAlways: 4,
+  StartAlways: 5,
+};
+
+function normalizePostCreate(value: string | number | undefined) {
+  if (value === undefined) return postCreateActions.DoNothing;
+  if (typeof value === "number") return value;
+  const found = postCreateActions[value];
+  if (found === undefined) {
+    throw new Error(`Unknown postCreate action "${value}". Use one of: ${Object.keys(postCreateActions).join(", ")}`);
+  }
+  return found;
+}
+
+function cleanParams(params: Record<string, unknown>) {
+  return Object.fromEntries(Object.entries(params).filter(([, value]) => value !== undefined));
+}
+
+function findGuid(value: unknown): string | null {
+  if (typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)) {
+    return value;
+  }
+  const record = asRecord(value);
+  if (!record) return null;
+  for (const key of ["Id", "ID", "TargetID", "TargetId", "InstanceID", "InstanceId"]) {
+    const guid = findGuid(record[key]);
+    if (guid) return guid;
+  }
+  return null;
+}
+
+async function resolveTargetAdsInstance(targetADSInstance?: string) {
+  if (targetADSInstance) return targetADSInstance;
+  const targetInfo = await ampRequest("ADSModule", "GetTargetInfo");
+  const targetId = findGuid(targetInfo);
+  if (targetId) return targetId;
+  throw new Error("Could not auto-detect TargetADSInstance. Pass targetADSInstance explicitly.");
 }
 
 server.registerTool(
@@ -554,6 +1042,445 @@ server.registerTool(
 );
 
 server.registerTool(
+  "amp_instances",
+  {
+    description: "List the policy-allowed AMP instances with friendly status summaries.",
+    inputSchema: {
+      raw: z.boolean().optional().describe("Include raw AMP instance/status payloads."),
+    },
+  },
+  async ({ raw }) => textResult(await summarizePolicyInstances(raw ?? false)),
+);
+
+server.registerTool(
+  "amp_status",
+  {
+    description: "Show status for the selected instance, a named instance, or all policy-allowed instances.",
+    inputSchema: {
+      instance: z.string().optional().describe("Instance name, friendly name, or ID. Omit to use the selected instance."),
+      all: z.boolean().optional().describe("Show every instance in the policy group."),
+      raw: z.boolean().optional().describe("Include raw AMP instance/status payloads when showing all."),
+    },
+  },
+  async ({ instance, all, raw }) => {
+    if (all || (!instance && !managedInstance)) return textResult(await summarizePolicyInstances(raw ?? false));
+    const selected = await resolvePolicyInstance(instance, true);
+    return textResult({ policyGroup, selected: summarizeInstance(selected, findStatusForInstance((await tryGetInstanceStatuses()).statuses, selected), raw ?? false) });
+  },
+);
+
+server.registerTool(
+  "amp_use_instance",
+  {
+    description: "Select an allowed AMP instance by name/friendly name/ID and prepare its managed API session.",
+    inputSchema: {
+      instance: z.string().min(1).describe("Instance name, friendly name, or ID. Partial names are okay if unique."),
+      startIfStopped: z.boolean().optional().describe("Start the instance first if AMP cannot manage it while stopped."),
+      waitTimeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ instance, startIfStopped, waitTimeoutMs }) => {
+    const selected = await resolvePolicyInstance(instance, false);
+    const ready = await ensureManagedInstance(selected, { startIfStopped: startIfStopped ?? false, waitTimeoutMs });
+    return textResult({
+      selected: summarizeInstance(ready.instance, null),
+      started: ready.started,
+      managed: Boolean(managedInstance),
+      hasManagedSession: Boolean(managedSessionId),
+      status: ready.status,
+    });
+  },
+);
+
+server.registerTool(
+  "amp_start_instance",
+  {
+    description: "Start a policy-allowed AMP instance by name/friendly name/ID, or the selected instance.",
+    inputSchema: {
+      instance: z.string().optional(),
+      wait: z.boolean().optional().describe("Wait until AMP reports the instance is running. Defaults to true."),
+      waitTimeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ instance, wait, waitTimeoutMs }) => {
+    const selected = await resolvePolicyInstance(instance, true);
+    const result = await startPolicyInstance(selected, wait ?? true, waitTimeoutMs);
+    return textResult({ instance: summarizeInstance(selected), ...result });
+  },
+);
+
+server.registerTool(
+  "amp_stop_instance",
+  {
+    description: "Stop a policy-allowed AMP instance by name/friendly name/ID, or the selected instance.",
+    inputSchema: {
+      instance: z.string().optional(),
+      wait: z.boolean().optional().describe("Wait until AMP reports the instance is stopped. Defaults to true."),
+      waitTimeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ instance, wait, waitTimeoutMs }) => {
+    const selected = await resolvePolicyInstance(instance, true);
+    const result = await stopPolicyInstance(selected, wait ?? true, waitTimeoutMs);
+    if (managedInstance && sameInstance(selected, managedInstance)) {
+      managedInstance = null;
+      managedSessionId = "";
+    }
+    return textResult({ instance: summarizeInstance(selected), ...result });
+  },
+);
+
+server.registerTool(
+  "amp_restart_instance",
+  {
+    description: "Restart a policy-allowed AMP instance. If it is stopped, this starts it instead.",
+    inputSchema: {
+      instance: z.string().optional(),
+      wait: z.boolean().optional().describe("Wait until AMP reports the instance is running. Defaults to true."),
+      waitTimeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ instance, wait, waitTimeoutMs }) => {
+    const selected = await resolvePolicyInstance(instance, true);
+    const before = await statusForInstance(selected);
+    let result: unknown;
+
+    if (before.running === false) {
+      const started = await startPolicyInstance(selected, wait ?? true, waitTimeoutMs);
+      return textResult({ instance: summarizeInstance(selected), restarted: false, startedBecauseStopped: true, ...started });
+    }
+
+    result = await callAdsMethod("RestartInstance", { InstanceName: instanceNameOrThrow(selected) });
+    if (managedInstance && sameInstance(selected, managedInstance)) managedSessionId = "";
+    const status = wait ?? true ? await waitForInstanceState(selected, true, waitTimeoutMs) : await statusForInstance(selected);
+    return textResult({ instance: summarizeInstance(selected), restarted: true, result, status });
+  },
+);
+
+server.registerTool(
+  "amp_files_list",
+  {
+    description: "List files/folders for the selected or named policy-allowed instance.",
+    inputSchema: {
+      path: z.string().optional().describe("AMP file-manager path. Defaults to the instance root."),
+      instance: z.string().optional().describe("Instance name, friendly name, or ID. Omit to use the selected instance."),
+      startIfStopped: z.boolean().optional().describe("Start the instance if needed. Defaults to true."),
+      waitTimeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ path: dir, instance, startIfStopped, waitTimeoutMs }) => {
+    const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
+    const listing = await listDirectory(selected, dir ?? ".");
+    return textResult({ instance: summarizeInstance(selected), ...listing });
+  },
+);
+
+server.registerTool(
+  "amp_file_read",
+  {
+    description: "Read a file from the selected or named policy-allowed instance using AMP's file manager.",
+    inputSchema: {
+      path: z.string().min(1).describe("AMP file-manager path to read."),
+      instance: z.string().optional().describe("Instance name, friendly name, or ID. Omit to use the selected instance."),
+      encoding: z.enum(["utf8", "base64"]).optional().describe("Return text as utf8 or raw base64. Defaults to utf8."),
+      maxBytes: z.number().int().positive().optional().describe("Maximum bytes to return. Defaults to AMP_MAX_READ_BYTES or 1 MiB."),
+      chunkSize: z.number().int().positive().optional().describe("Read chunk size in bytes."),
+      startIfStopped: z.boolean().optional().describe("Start the instance if needed. Defaults to true."),
+      waitTimeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ path: filePath, instance, encoding, maxBytes, chunkSize, startIfStopped, waitTimeoutMs }) => {
+    const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
+    const file = await readFileContent(selected, filePath, maxBytes, chunkSize ?? defaultFileChunkBytes);
+    return textResult({
+      instance: summarizeInstance(selected),
+      path: file.filename,
+      encoding: encoding ?? "utf8",
+      bytesRead: file.bytesRead,
+      sizeBytes: file.sizeBytes,
+      truncated: file.truncated,
+      content: (encoding ?? "utf8") === "base64" ? file.buffer.toString("base64") : file.buffer.toString("utf8"),
+    });
+  },
+);
+
+server.registerTool(
+  "amp_file_write",
+  {
+    description: "Overwrite a file on the selected or named policy-allowed instance using AMP's file manager.",
+    inputSchema: {
+      path: z.string().min(1).describe("AMP file-manager path to write."),
+      content: z.string().describe("File content. Interpreted as UTF-8 unless encoding is base64."),
+      instance: z.string().optional().describe("Instance name, friendly name, or ID. Omit to use the selected instance."),
+      encoding: z.enum(["utf8", "base64"]).optional(),
+      chunkSize: z.number().int().positive().optional(),
+      startIfStopped: z.boolean().optional().describe("Start the instance if needed. Defaults to true."),
+      waitTimeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ path: filePath, content, instance, encoding, chunkSize, startIfStopped, waitTimeoutMs }) => {
+    const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
+    const result = await writeFileContent(selected, filePath, content, encoding ?? "utf8", chunkSize ?? defaultFileChunkBytes);
+    return textResult({ instance: summarizeInstance(selected), ...result });
+  },
+);
+
+server.registerTool(
+  "amp_file_append",
+  {
+    description: "Append text or base64 data to a file on the selected or named policy-allowed instance.",
+    inputSchema: {
+      path: z.string().min(1).describe("AMP file-manager path to append."),
+      content: z.string().describe("Content to append. Interpreted as UTF-8 unless encoding is base64."),
+      instance: z.string().optional().describe("Instance name, friendly name, or ID. Omit to use the selected instance."),
+      encoding: z.enum(["utf8", "base64"]).optional(),
+      startIfStopped: z.boolean().optional().describe("Start the instance if needed. Defaults to true."),
+      waitTimeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ path: filePath, content, instance, encoding, startIfStopped, waitTimeoutMs }) => {
+    const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
+    const result = await appendFileContent(selected, filePath, content, encoding ?? "utf8");
+    return textResult({ instance: summarizeInstance(selected), ...result });
+  },
+);
+
+server.registerTool(
+  "amp_file_rename",
+  {
+    description: "Rename a file on the selected or named policy-allowed instance.",
+    inputSchema: {
+      path: z.string().min(1).describe("Current AMP file-manager path."),
+      newPath: z.string().min(1).describe("New AMP file-manager path."),
+      instance: z.string().optional().describe("Instance name, friendly name, or ID. Omit to use the selected instance."),
+      startIfStopped: z.boolean().optional().describe("Start the instance if needed. Defaults to true."),
+      waitTimeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ path: filePath, newPath, instance, startIfStopped, waitTimeoutMs }) => {
+    const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
+    const result = await callManagedMethod(selected, "FileManagerPlugin", "RenameFile", {
+      Filename: normalizeAmpPath(filePath),
+      NewFilename: normalizeAmpPath(newPath),
+    });
+    return textResult({ instance: summarizeInstance(selected), path: normalizeAmpPath(filePath), newPath: normalizeAmpPath(newPath), result });
+  },
+);
+
+server.registerTool(
+  "amp_file_copy",
+  {
+    description: "Copy a file into another directory on the selected or named policy-allowed instance.",
+    inputSchema: {
+      path: z.string().min(1).describe("Source AMP file-manager path."),
+      targetDirectory: z.string().min(1).describe("Destination directory path."),
+      instance: z.string().optional().describe("Instance name, friendly name, or ID. Omit to use the selected instance."),
+      startIfStopped: z.boolean().optional().describe("Start the instance if needed. Defaults to true."),
+      waitTimeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ path: filePath, targetDirectory, instance, startIfStopped, waitTimeoutMs }) => {
+    const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
+    const result = await callManagedMethod(selected, "FileManagerPlugin", "CopyFile", {
+      Origin: normalizeAmpPath(filePath),
+      TargetDirectory: normalizeAmpPath(targetDirectory),
+    });
+    return textResult({ instance: summarizeInstance(selected), path: normalizeAmpPath(filePath), targetDirectory: normalizeAmpPath(targetDirectory), result });
+  },
+);
+
+server.registerTool(
+  "amp_file_trash",
+  {
+    description: "Move a file to AMP trash on the selected or named policy-allowed instance.",
+    inputSchema: {
+      path: z.string().min(1).describe("AMP file-manager path to trash."),
+      instance: z.string().optional().describe("Instance name, friendly name, or ID. Omit to use the selected instance."),
+      startIfStopped: z.boolean().optional().describe("Start the instance if needed. Defaults to true."),
+      waitTimeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ path: filePath, instance, startIfStopped, waitTimeoutMs }) => {
+    const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
+    const normalizedPath = normalizeAmpPath(filePath);
+    const result = await callManagedMethod(selected, "FileManagerPlugin", "TrashFile", { Filename: normalizedPath });
+    return textResult({ instance: summarizeInstance(selected), path: normalizedPath, trashed: true, result });
+  },
+);
+
+server.registerTool(
+  "amp_directory_create",
+  {
+    description: "Create a directory on the selected or named policy-allowed instance.",
+    inputSchema: {
+      path: z.string().min(1).describe("AMP file-manager directory path to create."),
+      instance: z.string().optional().describe("Instance name, friendly name, or ID. Omit to use the selected instance."),
+      startIfStopped: z.boolean().optional().describe("Start the instance if needed. Defaults to true."),
+      waitTimeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ path: dirPath, instance, startIfStopped, waitTimeoutMs }) => {
+    const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
+    const normalizedPath = normalizeAmpPath(dirPath);
+    const result = await callManagedMethod(selected, "FileManagerPlugin", "CreateDirectory", { NewPath: normalizedPath });
+    return textResult({ instance: summarizeInstance(selected), path: normalizedPath, result });
+  },
+);
+
+server.registerTool(
+  "amp_directory_rename",
+  {
+    description: "Rename a directory on the selected or named policy-allowed instance.",
+    inputSchema: {
+      path: z.string().min(1).describe("Current AMP file-manager directory path."),
+      newName: z.string().min(1).describe("New directory name only, not a full path."),
+      instance: z.string().optional().describe("Instance name, friendly name, or ID. Omit to use the selected instance."),
+      startIfStopped: z.boolean().optional().describe("Start the instance if needed. Defaults to true."),
+      waitTimeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ path: dirPath, newName, instance, startIfStopped, waitTimeoutMs }) => {
+    const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
+    const result = await callManagedMethod(selected, "FileManagerPlugin", "RenameDirectory", {
+      oldDirectory: normalizeAmpPath(dirPath),
+      NewDirectoryName: newName,
+    });
+    return textResult({ instance: summarizeInstance(selected), path: normalizeAmpPath(dirPath), newName, result });
+  },
+);
+
+server.registerTool(
+  "amp_directory_trash",
+  {
+    description: "Move a directory to AMP trash on the selected or named policy-allowed instance.",
+    inputSchema: {
+      path: z.string().min(1).describe("AMP file-manager directory path to trash."),
+      instance: z.string().optional().describe("Instance name, friendly name, or ID. Omit to use the selected instance."),
+      startIfStopped: z.boolean().optional().describe("Start the instance if needed. Defaults to true."),
+      waitTimeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ path: dirPath, instance, startIfStopped, waitTimeoutMs }) => {
+    const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
+    const normalizedPath = normalizeAmpPath(dirPath);
+    const result = await callManagedMethod(selected, "FileManagerPlugin", "TrashDirectory", { DirectoryName: normalizedPath });
+    return textResult({ instance: summarizeInstance(selected), path: normalizedPath, trashed: true, result });
+  },
+);
+
+server.registerTool(
+  "amp_console_read",
+  {
+    description: "Read recent console/status updates from the selected or named policy-allowed instance.",
+    inputSchema: {
+      instance: z.string().optional().describe("Instance name, friendly name, or ID. Omit to use the selected instance."),
+      startIfStopped: z.boolean().optional().describe("Start the instance if needed. Defaults to true."),
+      waitTimeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ instance, startIfStopped, waitTimeoutMs }) => {
+    const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
+    return textResult({ instance: summarizeInstance(selected), updates: await callManagedMethod(selected, "Core", "GetUpdates") });
+  },
+);
+
+server.registerTool(
+  "amp_console_send",
+  {
+    description: "Send a console command/message to the selected or named policy-allowed instance.",
+    inputSchema: {
+      message: z.string().min(1),
+      instance: z.string().optional().describe("Instance name, friendly name, or ID. Omit to use the selected instance."),
+      startIfStopped: z.boolean().optional().describe("Start the instance if needed. Defaults to true."),
+      waitTimeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ message, instance, startIfStopped, waitTimeoutMs }) => {
+    const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
+    const result = await callManagedMethod(selected, "Core", "SendConsoleMessage", { message });
+    return textResult({ instance: summarizeInstance(selected), sent: message, result });
+  },
+);
+
+server.registerTool(
+  "amp_supported_apps",
+  {
+    description: "List AMP-supported application modules that can be used when creating instances.",
+    inputSchema: {
+      full: z.boolean().optional().describe("Return full application records instead of summaries."),
+    },
+  },
+  async ({ full }) => {
+    const method = full ? "GetSupportedApplications" : "GetSupportedAppSummaries";
+    return textResult(await ampRequest("ADSModule", method));
+  },
+);
+
+server.registerTool(
+  "amp_create_instance",
+  {
+    description: `Create a new AMP instance in the configured policy group (${policyGroup}). Auto-configured by default.`,
+    inputSchema: {
+      module: z.string().min(1).describe("AMP module name, for example Minecraft or Rust."),
+      friendlyName: z.string().min(1).describe("Human-friendly display name for the new instance."),
+      instanceName: z.string().optional().describe("Internal instance name. Defaults to a safe name generated from friendlyName."),
+      targetADSInstance: z.string().optional().describe("Target ADS instance GUID. Auto-detected when possible."),
+      newInstanceId: z.string().optional().describe("New instance GUID. Generated when omitted."),
+      autoConfigure: z.boolean().optional().describe("Let AMP choose ports/settings. Defaults to true."),
+      ipBinding: z.string().optional().describe("Used when autoConfigure is false. Defaults to 0.0.0.0."),
+      portNumber: z.number().int().nonnegative().optional().describe("Used when autoConfigure is false."),
+      adminUsername: z.string().optional().describe("Module admin username if the app requires one. Defaults to admin."),
+      adminPassword: z.string().optional().describe("Module admin password if the app requires one. Generated when omitted."),
+      provisionSettings: z.record(z.string(), z.string()).optional(),
+      postCreate: z.union([z.enum(["DoNothing", "UpdateOnce", "UpdateAlways", "UpdateAndStartOnce", "UpdateAndStartAlways", "StartAlways"]), z.number().int()]).optional(),
+      startOnBoot: z.boolean().optional(),
+      displayImageSource: z.string().optional(),
+      targetDatastore: z.number().int().optional(),
+    },
+  },
+  async (args) => {
+    const autoConfigure = args.autoConfigure ?? true;
+    if (!autoConfigure && args.portNumber === undefined) {
+      throw new Error("portNumber is required when autoConfigure is false.");
+    }
+
+    const safeName =
+      args.instanceName ??
+      `${args.friendlyName.replace(/[^a-zA-Z0-9_-]+/g, "").slice(0, 40) || "AMPInstance"}${randomUUID().slice(0, 8)}`;
+    const targetADSInstance = await resolveTargetAdsInstance(args.targetADSInstance);
+    const body = cleanParams({
+      TargetADSInstance: targetADSInstance,
+      NewInstanceId: args.newInstanceId ?? randomUUID(),
+      Module: args.module,
+      InstanceName: safeName,
+      FriendlyName: args.friendlyName,
+      IPBinding: args.ipBinding ?? "0.0.0.0",
+      PortNumber: args.portNumber ?? 0,
+      AdminUsername: args.adminUsername ?? "admin",
+      AdminPassword: args.adminPassword ?? randomUUID(),
+      ProvisionSettings: args.provisionSettings ?? {},
+      AutoConfigure: autoConfigure,
+      PostCreate: normalizePostCreate(args.postCreate),
+      StartOnBoot: args.startOnBoot ?? false,
+      DisplayImageSource: args.displayImageSource,
+      TargetDatastore: args.targetDatastore,
+      Group: policyGroup,
+    });
+
+    const result = await callAdsMethod("CreateInstance", body);
+    return textResult({
+      policyGroup,
+      instanceName: safeName,
+      friendlyName: args.friendlyName,
+      module: args.module,
+      targetADSInstance,
+      result,
+      note: `The MCP policy forces this instance into display group "${policyGroup}".`,
+    });
+  },
+);
+
+server.registerTool(
   "amp_call",
   {
     description: "Call any method from the captured/refreshed AMP API spec.",
@@ -574,11 +1501,7 @@ server.registerTool(
     const useManagedRoute = Boolean(managedInstance && moduleName !== "ADSModule");
     const result = await ampRequest(moduleName, methodName, policyBody, useManagedRoute ? managedInstance : null);
     await updateManagedInstance(moduleName, methodName, policyBody, result);
-    if (isAmpError(result)) {
-      throw new Error(
-        `AMP rejected ${moduleName}/${methodName}: ${getAmpErrorMessage(result)}`,
-      );
-    }
+    assertAmpAccepted(`${moduleName}/${methodName}`, result);
     return textResult(result);
   },
 );
