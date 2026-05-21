@@ -1007,14 +1007,14 @@ server.registerTool(
   "amp_login_from_env",
   {
     description:
-      "Authenticate using AMP_USERNAME, AMP_PASSWORD, optional AMP_TOKEN, and optional AMP_REMEMBER_ME from .env. Credentials are never returned.",
+      "Authenticate using AMP_USERNAME, AMP_PASSWORD, optional AMP_TOKEN, and optional AMP_REMEMBER_ME from the process environment or .env. Credentials are never returned.",
     inputSchema: {},
   },
   async () => {
     const username = process.env.AMP_USERNAME;
     const password = process.env.AMP_PASSWORD;
     if (!username || !password) {
-      throw new Error("Set AMP_USERNAME and AMP_PASSWORD in .env before using amp_login_from_env.");
+      throw new Error("Set AMP_USERNAME and AMP_PASSWORD in the MCP environment or .env before using amp_login_from_env.");
     }
 
     const result = await ampRequest("Core", "Login", {
@@ -1038,6 +1038,37 @@ server.registerTool(
     managedInstance = null;
     managedSessionId = "";
     return textResult({ baseUrl, hasSession: false });
+  },
+);
+
+server.registerTool(
+  "amp_connection_status",
+  {
+    description: "Show non-secret AMP connection configuration and MCP policy state.",
+    inputSchema: {
+      checkInstances: z.boolean().optional().describe("Also count visible policy-group instances."),
+    },
+  },
+  async ({ checkInstances }) => {
+    const result: AmpRecord = {
+      baseUrl,
+      hasUsername: Boolean(process.env.AMP_USERNAME),
+      hasPassword: Boolean(process.env.AMP_PASSWORD),
+      hasToken: Boolean(process.env.AMP_TOKEN),
+      hasControllerSession: Boolean(sessionId),
+      hasManagedSession: Boolean(managedSessionId),
+      policyEnabled,
+      policyGroup,
+      selected: instanceLabel(managedInstance),
+    };
+
+    if (checkInstances) {
+      const instances = await getPolicyInstances();
+      result.policyInstanceCount = instances.length;
+      result.policyInstances = instances.map((instance) => summarizeInstance(instance));
+    }
+
+    return textResult(result);
   },
 );
 
@@ -1421,7 +1452,7 @@ server.registerTool(
   {
     description: `Create a new AMP instance in the configured policy group (${policyGroup}). Auto-configured by default.`,
     inputSchema: {
-      module: z.string().min(1).describe("AMP module name, for example Minecraft or Rust."),
+      module: z.string().min(1).describe("AMP module name, for example Minecraft, Valheim, or any module reported by amp_supported_apps."),
       friendlyName: z.string().min(1).describe("Human-friendly display name for the new instance."),
       instanceName: z.string().optional().describe("Internal instance name. Defaults to a safe name generated from friendlyName."),
       targetADSInstance: z.string().optional().describe("Target ADS instance GUID. Auto-detected when possible."),
@@ -1522,7 +1553,7 @@ async function selfTest() {
 
   if (process.argv.includes("--self-test-login")) {
     if (!process.env.AMP_USERNAME || !process.env.AMP_PASSWORD) {
-      throw new Error("Set AMP_USERNAME and AMP_PASSWORD in .env to run --self-test-login.");
+      throw new Error("Set AMP_USERNAME and AMP_PASSWORD in the MCP environment or .env to run --self-test-login.");
     }
     const loginResult = await ampRequest("Core", "Login", {
       username: process.env.AMP_USERNAME,

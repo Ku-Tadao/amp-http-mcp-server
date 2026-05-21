@@ -34,7 +34,7 @@ npm run build
 npm test
 ```
 
-Copy the example environment file and fill it in:
+Copy the example environment file and fill it in if your MCP client does not inject environment variables itself:
 
 ```powershell
 Copy-Item .env.example .env
@@ -61,6 +61,8 @@ npm run build
 node dist/server.js --self-test-login
 ```
 
+If you run this from Codex, you can put the same values under `[mcp_servers.amp.env]` in `C:\Users\User\.codex\config.toml` instead of creating a repo-local `.env`. In that setup `.env` may not exist, and that is fine.
+
 ## MCP Config
 
 ```json
@@ -70,7 +72,11 @@ node dist/server.js --self-test-login
       "command": "node",
       "args": ["C:\\path\\to\\amp-http-mcp-server\\dist\\server.js"],
       "env": {
-        "AMP_BASE_URL": "https://amp.example.com"
+        "AMP_BASE_URL": "https://amp.example.com",
+        "AMP_USERNAME": "amp-automation-user",
+        "AMP_PASSWORD": "change-me",
+        "AMP_POLICY_ENABLED": "true",
+        "AMP_POLICY_GROUP": "AI"
       }
     }
   }
@@ -83,6 +89,7 @@ You can also provide `AMP_SESSION_ID`, but `amp_login` or `amp_login_from_env` i
 
 Friendly day-to-day tools:
 
+- `amp_connection_status`: show non-secret connection and policy status
 - `amp_instances`: list instances in the configured policy group
 - `amp_status`: show status for one instance, the selected instance, or all allowed instances
 - `amp_use_instance`: select an instance by name, friendly name, or ID
@@ -112,7 +119,7 @@ Setup and escape-hatch tools:
 - `amp_policy_instances`: list instances currently allowed by the MCP policy group
 - `amp_auth_requirements`: call `Core/GetAuthenticationRequirements`
 - `amp_login`: call `Core/Login` with explicit credentials
-- `amp_login_from_env`: call `Core/Login` using `.env` credentials
+- `amp_login_from_env`: call `Core/Login` using environment or `.env` credentials
 - `amp_clear_session`: forget stored controller and managed-instance sessions
 - `amp_call`: call any method in the loaded AMP API spec
 
@@ -132,7 +139,7 @@ Select one by a unique partial name:
 
 ```json
 {
-  "instance": "rust",
+  "instance": "my-server",
   "startIfStopped": true
 }
 ```
@@ -143,17 +150,17 @@ List a folder:
 
 ```json
 {
-  "path": "oxide/plugins"
+  "path": "."
 }
 ```
 
 with `amp_files_list`.
 
-Read a plugin:
+Read a file:
 
 ```json
 {
-  "path": "oxide/plugins/MyPlugin.cs"
+  "path": "config/server.cfg"
 }
 ```
 
@@ -163,8 +170,8 @@ Write a file:
 
 ```json
 {
-  "path": "oxide/plugins/Example.cs",
-  "content": "using Oxide.Core;\n"
+  "path": "notes/Example.txt",
+  "content": "Hello from AMP MCP\n"
 }
 ```
 
@@ -174,7 +181,7 @@ Move a file to trash:
 
 ```json
 {
-  "path": "oxide/plugins/OldExample.cs"
+  "path": "notes/OldExample.txt"
 }
 ```
 
@@ -196,8 +203,8 @@ To create a new instance, first inspect modules with `amp_supported_apps`, then 
 
 ```json
 {
-  "module": "Rust",
-  "friendlyName": "AI Test Rust",
+  "module": "Minecraft",
+  "friendlyName": "AI Test Server",
   "autoConfigure": true
 }
 ```
@@ -249,4 +256,4 @@ The bundled `src/amp-api-spec.json` is only a fallback. After login, call:
 }
 ```
 
-with `amp_api_spec` to load the live methods exposed by your AMP server and plugins.
+with `amp_api_spec` to load the live methods exposed by your AMP server, modules, and extensions.
