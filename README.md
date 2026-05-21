@@ -85,6 +85,18 @@ If you run this from Codex, you can put the same values under `[mcp_servers.amp.
 
 You can also provide `AMP_SESSION_ID`, but `amp_login` or `amp_login_from_env` is usually cleaner because the server stores the session in memory and redacts it from tool output.
 
+## Codex Skill
+
+This repo includes a Codex skill at `.agents/skills/amp-mcp`. It teaches Codex how to use the friendly AMP MCP tools, diagnose missing environment/policy setup, avoid treating `amp_api_spec` as a raw AMP module, and keep operations inside the configured policy group.
+
+When working inside this repository, Codex can discover the repo-scoped skill automatically. To make it available globally on your machine, copy or install `.agents/skills/amp-mcp` into:
+
+```text
+%USERPROFILE%\.agents\skills\amp-mcp
+```
+
+Restart Codex after installing a new global skill.
+
 ## Tools
 
 Friendly day-to-day tools:

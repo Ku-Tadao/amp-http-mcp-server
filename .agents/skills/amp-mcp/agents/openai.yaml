@@ -1,0 +1,13 @@
+interface:
+  display_name: "AMP MCP"
+  short_description: "Operate CubeCoders AMP through MCP"
+  default_prompt: "Use $amp-mcp to inspect AMP connection status and operate allowed instances safely."
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "amp"
+      description: "AMP MCP server with friendly CubeCoders AMP instance, file, console, and API tools."
+
+policy:
+  allow_implicit_invocation: true
