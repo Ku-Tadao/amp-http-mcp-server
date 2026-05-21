@@ -122,16 +122,25 @@ function redact(value: unknown): unknown {
   return value;
 }
 
-function methodMeta(moduleName: string, methodName: string) {
-  const module = cachedSpec[moduleName];
-  if (!module) {
-    throw new Error(`Unknown AMP module "${moduleName}". Use amp_api_spec to list modules.`);
+function findMethodMeta(moduleName: string, methodName: string) {
+  return cachedSpec[moduleName]?.[methodName] ?? null;
+}
+
+async function resolveMethodMeta(moduleName: string, methodName: string) {
+  let meta = findMethodMeta(moduleName, methodName);
+  if (meta) return { meta, refreshed: false, refreshError: "" };
+
+  try {
+    cachedSpec = (await ampRequest("Core", "GetAPISpec")) as AmpSpec;
+    meta = findMethodMeta(moduleName, methodName);
+    return { meta, refreshed: true, refreshError: "" };
+  } catch (error) {
+    return {
+      meta: null,
+      refreshed: false,
+      refreshError: error instanceof Error ? error.message : String(error),
+    };
   }
-  const method = module[methodName];
-  if (!method) {
-    throw new Error(`Unknown AMP method "${moduleName}/${methodName}". Use amp_api_spec to list methods.`);
-  }
-  return method;
 }
 
 function coerceValue(parameter: AmpParameter, value: unknown) {
@@ -167,14 +176,32 @@ function normalizeParams(meta: AmpMethod, params: Record<string, unknown>) {
 
 function requiresConfirmation(moduleName: string, methodName: string) {
   const name = `${moduleName}/${methodName}`.toLowerCase();
+  const method = methodName.toLowerCase();
+  const readOnlyCalls = new Set([
+    "adsmodule/getinstances",
+    "adsmodule/getinstance",
+    "adsmodule/getinstancestatuses",
+    "adsmodule/getlocalinstances",
+    "adsmodule/getsupportedapplications",
+    "adsmodule/getsupportedappsummaries",
+    "adsmodule/gettargetinfo",
+    "core/getapispec",
+    "core/getmoduleinfo",
+    "core/getauthenticationrequirements",
+    "core/getwebauthncredentialids",
+    "core/getoidcloginurl",
+    "core/login",
+    "core/oidclogin",
+    "core/getstatus",
+    "core/getupdates",
+    "filemanagerplugin/getdirectorylisting",
+    "filemanagerplugin/readfilechunk",
+  ]);
+  if (readOnlyCalls.has(name)) return false;
   return !(
-    name === "core/getapispec" ||
-    name === "core/getmoduleinfo" ||
-    name === "core/getauthenticationrequirements" ||
-    name === "core/getwebauthncredentialids" ||
-    name === "core/getoidcloginurl" ||
-    name === "core/login" ||
-    name === "core/oidclogin"
+    method.startsWith("get") ||
+    method.startsWith("list") ||
+    method.startsWith("read")
   );
 }
 
@@ -948,7 +975,15 @@ server.registerTool(
     if (refresh) {
       cachedSpec = (await ampRequest("Core", "GetAPISpec")) as AmpSpec;
     }
-    return textResult(moduleName ? { [moduleName]: cachedSpec[moduleName] ?? null } : cachedSpec);
+    if (moduleName) {
+      return textResult({
+        moduleName,
+        module: cachedSpec[moduleName] ?? null,
+        availableModules: Object.keys(cachedSpec),
+        refreshed: refresh ?? false,
+      });
+    }
+    return textResult(cachedSpec);
   },
 );
 
@@ -964,10 +999,25 @@ server.registerTool(
 server.registerTool(
   "amp_policy_instances",
   {
-    description: "List the AMP instances currently allowed by the MCP policy group.",
+    description: "List the AMP instances currently allowed by the MCP policy group, with non-secret diagnostics.",
     inputSchema: {},
   },
-  async () => textResult({ policyEnabled, policyGroup, instances: await getPolicyInstances() }),
+  async () => {
+    const instances = await getPolicyInstances();
+    return textResult({
+      baseUrl,
+      hasUsername: Boolean(process.env.AMP_USERNAME),
+      hasPassword: Boolean(process.env.AMP_PASSWORD),
+      hasControllerSession: Boolean(sessionId),
+      policyEnabled,
+      policyGroup,
+      instances,
+      warning:
+        instances.length === 0
+          ? "No instances are visible in the policy group. Check that this MCP process received AMP_BASE_URL plus AMP_USERNAME/AMP_PASSWORD or AMP_SESSION_ID, and that the AMP user can see instances in AMP_POLICY_GROUP."
+          : undefined,
+    });
+  },
 );
 
 server.registerTool(
@@ -1523,7 +1573,16 @@ server.registerTool(
     },
   },
   async ({ moduleName, methodName, params, confirm }) => {
-    const meta = methodMeta(moduleName, methodName);
+    const { meta, refreshed, refreshError } = await resolveMethodMeta(moduleName, methodName);
+    if (!meta) {
+      if (moduleName.toLowerCase() === "amp_api_spec") {
+        throw new Error("amp_api_spec is an MCP tool, not an AMP API module. Call the amp_api_spec tool directly.");
+      }
+      const refreshHint = refreshError ? ` Live spec refresh failed: ${refreshError}` : "";
+      throw new Error(
+        `Unknown AMP method "${moduleName}/${methodName}" in the bundled${refreshed ? " and refreshed" : ""} API spec.${refreshHint} Call the amp_api_spec tool directly to inspect available modules/methods.`,
+      );
+    }
     if (requiresConfirmation(moduleName, methodName) && !confirm) {
       throw new Error(`Refusing to call state-changing method ${moduleName}/${methodName} without confirm: true.`);
     }
