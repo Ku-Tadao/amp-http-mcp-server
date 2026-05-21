@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -856,18 +857,67 @@ async function readFileContent(instance: AmpInstance, filePath: string, maxBytes
   return { filename, bytesRead: offset, sizeBytes: size ?? null, truncated, buffer: Buffer.concat(chunks) };
 }
 
-async function writeFileContent(instance: AmpInstance, filePath: string, content: string, encoding: "utf8" | "base64", chunkSize = defaultFileChunkBytes) {
-  const filename = normalizeAmpPath(filePath);
-  const buffer = encoding === "base64" ? Buffer.from(content, "base64") : Buffer.from(content, "utf8");
+function ampDirname(filePath: string) {
+  const normalized = normalizeAmpPath(filePath);
+  const slash = normalized.lastIndexOf("/");
+  return slash <= 0 ? "" : normalized.slice(0, slash);
+}
+
+function ampBasename(filePath: string) {
+  const normalized = normalizeAmpPath(filePath);
+  const slash = normalized.lastIndexOf("/");
+  return slash < 0 ? normalized : normalized.slice(slash + 1);
+}
+
+async function directoryExists(instance: AmpInstance, dir: string) {
+  try {
+    await listDirectory(instance, dir);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function resolveWritablePath(instance: AmpInstance, filePath: string) {
+  const normalized = normalizeAmpPath(filePath);
+  const dir = ampDirname(normalized);
+  if (await directoryExists(instance, dir)) return normalized;
+
+  const candidates = new Set<string>();
+  const basename = ampBasename(normalized);
+  const withoutServerIdentity = normalized.replace(/^server\/my_server_identity\//i, "");
+  const withoutRustPrefix = normalized.replace(/^rust\/258550\//i, "258550/");
+  candidates.add(withoutServerIdentity);
+  candidates.add(withoutRustPrefix);
+
+  if (!/^258550\//i.test(normalized)) {
+    candidates.add(`258550/${withoutServerIdentity}`);
+    candidates.add(`258550/${normalized}`);
+  }
+  if (/oxide\/plugins\/[^/]+$/i.test(normalized)) {
+    candidates.add(`258550/oxide/plugins/${basename}`);
+  }
+
+  for (const candidate of candidates) {
+    const normalizedCandidate = normalizeAmpPath(candidate);
+    if (normalizedCandidate === normalized) continue;
+    if (await directoryExists(instance, ampDirname(normalizedCandidate))) return normalizedCandidate;
+  }
+
+  return normalized;
+}
+
+async function writeBufferContent(instance: AmpInstance, filename: string, buffer: Buffer, chunkSize = defaultFileChunkBytes) {
+  const normalizedFilename = normalizeAmpPath(filename);
 
   if (buffer.length === 0) {
     const result = await callManagedMethod(instance, "FileManagerPlugin", "WriteFileChunk", {
-      Filename: filename,
+      Filename: normalizedFilename,
       Data: "",
       Offset: 0,
       FinalChunk: true,
     });
-    return { filename, bytesWritten: 0, result };
+    return { filename: normalizedFilename, bytesWritten: 0, result };
   }
 
   let offset = 0;
@@ -876,7 +926,7 @@ async function writeFileContent(instance: AmpInstance, filePath: string, content
     const nextOffset = Math.min(offset + chunkSize, buffer.length);
     const chunk = buffer.subarray(offset, nextOffset);
     lastResult = await callManagedMethod(instance, "FileManagerPlugin", "WriteFileChunk", {
-      Filename: filename,
+      Filename: normalizedFilename,
       Data: chunk.toString("base64"),
       Offset: offset,
       FinalChunk: nextOffset >= buffer.length,
@@ -884,7 +934,35 @@ async function writeFileContent(instance: AmpInstance, filePath: string, content
     offset = nextOffset;
   }
 
-  return { filename, bytesWritten: buffer.length, result: lastResult };
+  return { filename: normalizedFilename, bytesWritten: buffer.length, result: lastResult };
+}
+
+async function uploadViaTemporaryFile(instance: AmpInstance, filePath: string, content: string, encoding: "utf8" | "base64", chunkSize = defaultFileChunkBytes) {
+  const filename = await resolveWritablePath(instance, filePath);
+  const buffer = encoding === "base64" ? Buffer.from(content, "base64") : Buffer.from(content, "utf8");
+  const tempDir = mkdtempSync(path.join(os.tmpdir(), "amp-mcp-upload-"));
+  const tempPath = path.join(tempDir, ampBasename(filename) || "upload.bin");
+
+  try {
+    writeFileSync(tempPath, buffer);
+    const staged = readFileSync(tempPath);
+    return await writeBufferContent(instance, filename, staged, chunkSize);
+  } finally {
+    try {
+      unlinkSync(tempPath);
+    } catch {
+      // Temp cleanup is best-effort; the parent directory cleanup below catches the common case.
+    }
+    try {
+      rmSync(tempDir, { recursive: true, force: true });
+    } catch {
+      // Ignore cleanup failures so the original AMP error is preserved.
+    }
+  }
+}
+
+async function writeFileContent(instance: AmpInstance, filePath: string, content: string, encoding: "utf8" | "base64", chunkSize = defaultFileChunkBytes) {
+  return uploadViaTemporaryFile(instance, filePath, content, encoding, chunkSize);
 }
 
 async function appendFileContent(instance: AmpInstance, filePath: string, content: string, encoding: "utf8" | "base64") {
