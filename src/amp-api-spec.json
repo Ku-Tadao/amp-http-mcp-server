@@ -1007,6 +1007,24 @@
           "Suffix": "",
           "Optional": true,
           "ParamEnumValues": null
+        },
+        {
+          "Name": "AdvertisedAddress",
+          "TypeName": "String",
+          "Description": "",
+          "Placeholder": "",
+          "Suffix": "",
+          "Optional": true,
+          "ParamEnumValues": null
+        },
+        {
+          "Name": "AdvertisedAddressIncludesPort",
+          "TypeName": "Boolean",
+          "Description": "",
+          "Placeholder": "",
+          "Suffix": "",
+          "Optional": true,
+          "ParamEnumValues": null
         }
       ],
       "ReturnTypeName": "ActionResult",
@@ -1051,6 +1069,26 @@
       "IsComplexType": true,
       "RequiredPermissions": [
         "ADS.InstanceManagement.Reconfigure"
+      ]
+    },
+    "GetInstanceLiveSettings": {
+      "Description": null,
+      "Returns": null,
+      "Parameters": [
+        {
+          "Name": "instanceId",
+          "TypeName": "Guid",
+          "Description": "",
+          "Placeholder": "",
+          "Suffix": "",
+          "Optional": false,
+          "ParamEnumValues": null
+        }
+      ],
+      "ReturnTypeName": "Dictionary<String, String>",
+      "IsComplexType": false,
+      "RequiredPermissions": [
+        "ADS.InstanceManagement.CreateInstance"
       ]
     },
     "CreateLocalInstance": {
@@ -1693,6 +1731,15 @@
         {
           "Name": "ContainerMaxCPU",
           "TypeName": "Nullable<Single>",
+          "Description": "",
+          "Placeholder": "",
+          "Suffix": "",
+          "Optional": true,
+          "ParamEnumValues": null
+        },
+        {
+          "Name": "ContainerCPUSet",
+          "TypeName": "String",
           "Description": "",
           "Placeholder": "",
           "Suffix": "",
@@ -4175,6 +4222,24 @@
           "Suffix": "",
           "Optional": false,
           "ParamEnumValues": null
+        },
+        {
+          "Name": "IsOIDCUser",
+          "TypeName": "Boolean",
+          "Description": "",
+          "Placeholder": "",
+          "Suffix": "",
+          "Optional": true,
+          "ParamEnumValues": null
+        },
+        {
+          "Name": "OIDCSub",
+          "TypeName": "String",
+          "Description": "",
+          "Placeholder": "",
+          "Suffix": "",
+          "Optional": true,
+          "ParamEnumValues": null
         }
       ],
       "ReturnTypeName": "ActionResult<Guid>",
@@ -4254,6 +4319,35 @@
         },
         {
           "Name": "EmailAddress",
+          "TypeName": "String",
+          "Description": "",
+          "Placeholder": "",
+          "Suffix": "",
+          "Optional": true,
+          "ParamEnumValues": null
+        }
+      ],
+      "ReturnTypeName": "ActionResult",
+      "IsComplexType": true,
+      "RequiredPermissions": [
+        "Core.UserManagement.UpdateUserInfo"
+      ]
+    },
+    "UpdateOIDCSub": {
+      "Description": null,
+      "Returns": null,
+      "Parameters": [
+        {
+          "Name": "Username",
+          "TypeName": "String",
+          "Description": "",
+          "Placeholder": "",
+          "Suffix": "",
+          "Optional": false,
+          "ParamEnumValues": null
+        },
+        {
+          "Name": "OIDCSub",
           "TypeName": "String",
           "Description": "",
           "Placeholder": "",
@@ -4588,19 +4682,59 @@
       "IsComplexType": true,
       "RequiredPermissions": []
     },
-    "GetOIDCLoginURL": {
+    "ConvertUserToOIDC": {
       "Description": null,
       "Returns": null,
       "Parameters": [
         {
-          "Name": "state",
+          "Name": "Username",
+          "TypeName": "String",
+          "Description": "",
+          "Placeholder": "",
+          "Suffix": "",
+          "Optional": false,
+          "ParamEnumValues": null
+        },
+        {
+          "Name": "OIDCSub",
           "TypeName": "String",
           "Description": "",
           "Placeholder": "",
           "Suffix": "",
           "Optional": true,
           "ParamEnumValues": null
-        },
+        }
+      ],
+      "ReturnTypeName": "ActionResult",
+      "IsComplexType": true,
+      "RequiredPermissions": [
+        "Core.UserManagement.UpdateUserInfo"
+      ]
+    },
+    "RevertUserFromOIDC": {
+      "Description": null,
+      "Returns": null,
+      "Parameters": [
+        {
+          "Name": "Username",
+          "TypeName": "String",
+          "Description": "",
+          "Placeholder": "",
+          "Suffix": "",
+          "Optional": false,
+          "ParamEnumValues": null
+        }
+      ],
+      "ReturnTypeName": "ActionResult",
+      "IsComplexType": true,
+      "RequiredPermissions": [
+        "Core.UserManagement.UpdateUserInfo"
+      ]
+    },
+    "GetOIDCLoginURL": {
+      "Description": null,
+      "Returns": null,
+      "Parameters": [
         {
           "Name": "redirect_uri",
           "TypeName": "String",
@@ -4639,6 +4773,15 @@
       "Parameters": [
         {
           "Name": "code",
+          "TypeName": "String",
+          "Description": "",
+          "Placeholder": "",
+          "Suffix": "",
+          "Optional": false,
+          "ParamEnumValues": null
+        },
+        {
+          "Name": "state",
           "TypeName": "String",
           "Description": "",
           "Placeholder": "",

@@ -4,6 +4,10 @@ An MCP server for the CubeCoders AMP HTTP API.
 
 AMP exposes a machine-readable API catalog through `Core/GetAPISpec`. This server provides a friendly MCP layer for common AMP operations such as listing instances, selecting a server, starting/stopping it, reading/writing files, and sending console commands. It also keeps a raw `amp_call` escape hatch for advanced API methods.
 
+Built on the MCP TypeScript SDK v2 (`@modelcontextprotocol/server`). It serves both protocol
+eras over stdio: clients that open with `initialize` negotiate the 2025 revision, and clients
+that send a 2026-07-28 `_meta` envelope get the current revision. No client-side change needed.
+
 ## How AMP Calls Work
 
 AMP API calls are made with:
@@ -137,6 +141,15 @@ Setup and escape-hatch tools:
 
 State-changing calls through `amp_call` require `confirm: true`.
 
+Every tool carries MCP annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`,
+`openWorldHint`) so clients can decide what to auto-run and what to confirm. Eight tools are
+marked read-only; ten are marked destructive, including `amp_stop_instance`, `amp_file_write`,
+`amp_file_trash`, `amp_console_send`, and `amp_call`.
+
+Note that the instance-scoped read tools (`amp_files_list`, `amp_file_read`, `amp_console_read`)
+are deliberately **not** marked read-only: they default to `startIfStopped: true` and will power
+on a stopped instance. Pass `startIfStopped: false` to keep them side-effect free.
+
 ## Friendly Workflows
 
 List the instances the MCP is allowed to touch:
@@ -233,7 +246,14 @@ Recommended setup:
 2. Create a dedicated AMP role for that user.
 3. Grant only the AMP permissions needed for the instances you want the MCP client to operate.
 4. Put those instances in a dedicated AMP display group, for example `AI`.
-5. Set `AMP_POLICY_ENABLED=true` and `AMP_POLICY_GROUP=AI`.
+5. Grant the automation user `Instances.<instanceId>.Manage` on each of those instances.
+6. Set `AMP_POLICY_ENABLED=true` and `AMP_POLICY_GROUP=AI`.
+
+Step 5 is the one that is easy to miss. `ADSModule/GetInstances` returns only the instances the
+user has an explicit Manage grant on, so without it the display group reads as empty and every
+instance tool refuses, even though AMP's web panel shows the servers. `amp_policy_instances`
+detects this and names the affected instances in its `warning`. Treat the permission list
+returned by `Core/Login` as authoritative rather than the role names shown in the panel.
 
 When the MCP policy is enabled:
 
@@ -269,3 +289,16 @@ The bundled `src/amp-api-spec.json` is only a fallback. After login, call:
 ```
 
 with `amp_api_spec` to load the live methods exposed by your AMP server, modules, and extensions.
+
+The controller spec does not list an application instance's own modules. After selecting an
+instance with `amp_use_instance`, pass:
+
+```json
+{
+  "fromManagedInstance": true
+}
+```
+
+to read that instance's own spec (`MinecraftModule`, `GenericModule`, and so on). `amp_call`
+resolves against the selected instance's spec automatically, so those application methods are
+callable once an instance is selected.

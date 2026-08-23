@@ -4,8 +4,8 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSyn
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { McpServer } from "@modelcontextprotocol/server";
+import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import * as z from "zod/v4";
 import fallbackSpec from "./amp-api-spec.json" with { type: "json" };
 
@@ -127,6 +127,22 @@ function findMethodMeta(moduleName: string, methodName: string) {
   return cachedSpec[moduleName]?.[methodName] ?? null;
 }
 
+// An application instance exposes its own modules (MinecraftModule, GenericModule,
+// srcdsModule, ...) that the ADS controller spec never lists. Cache the managed
+// instance's spec keyed by instance ID so switching instances invalidates it.
+let managedSpec: AmpSpec | null = null;
+let managedSpecInstanceId = "";
+
+async function getManagedSpec() {
+  if (!managedInstance) return null;
+  const id = instanceIdOf(managedInstance);
+  if (!id) return null;
+  if (managedSpec && managedSpecInstanceId === id) return managedSpec;
+  managedSpec = (await ampRequest("Core", "GetAPISpec", {}, managedInstance)) as AmpSpec;
+  managedSpecInstanceId = id;
+  return managedSpec;
+}
+
 async function resolveMethodMeta(moduleName: string, methodName: string) {
   let meta = findMethodMeta(moduleName, methodName);
   if (meta) return { meta, refreshed: false, refreshError: "" };
@@ -134,7 +150,10 @@ async function resolveMethodMeta(moduleName: string, methodName: string) {
   try {
     cachedSpec = (await ampRequest("Core", "GetAPISpec")) as AmpSpec;
     meta = findMethodMeta(moduleName, methodName);
-    return { meta, refreshed: true, refreshError: "" };
+    if (meta) return { meta, refreshed: true, refreshError: "" };
+
+    const instanceSpec = await getManagedSpec();
+    return { meta: instanceSpec?.[moduleName]?.[methodName] ?? null, refreshed: true, refreshError: "" };
   } catch (error) {
     return {
       meta: null,
@@ -419,6 +438,25 @@ async function getKnownInstances() {
       return [group];
     })
     .filter((instance): instance is AmpInstance => Boolean(instance && typeof instance === "object"));
+}
+
+// ADSModule/GetInstances only reports instances the AMP user holds an explicit
+// Instances.<id>.Manage grant on, so a display group can look empty even when it
+// has members. Name those members so the fix (grant Manage) is obvious.
+async function explainEmptyPolicyGroup() {
+  const base =
+    "No instances are visible in the policy group. Check that this MCP process received AMP_BASE_URL plus AMP_USERNAME/AMP_PASSWORD or AMP_SESSION_ID, and that the AMP user can see instances in AMP_POLICY_GROUP.";
+  let unmanageable: string[] = [];
+  try {
+    unmanageable = asArray(await ampRequest("ADSModule", "GetLocalInstances"))
+      .filter((instance): instance is AmpInstance => Boolean(instance && typeof instance === "object"))
+      .filter((instance) => (instance.Group ?? "") === policyGroup)
+      .map((instance) => `${instance.InstanceName ?? instanceIdOf(instance)} (${instanceIdOf(instance)})`);
+  } catch {
+    // GetLocalInstances is only used to enrich this message; ignore if unavailable.
+  }
+  if (unmanageable.length === 0) return base;
+  return `${base} Display group "${policyGroup}" does contain ${unmanageable.join(", ")}, but this AMP user has no Instances.<id>.Manage grant for them, so ADSModule/GetInstances hides them. Grant Manage on those instances to the AMP user.`;
 }
 
 async function getPolicyInstances() {
@@ -779,16 +817,18 @@ async function managedInstanceFor(query?: string, startIfStopped = true, waitTim
   return ready.instance;
 }
 
-function normalizeAmpPath(value: string | undefined, fallback = ".") {
-  const normalized = (value?.trim() || fallback).replace(/\\/g, "/").replace(/^\/+/, "");
-  return normalized || fallback;
+// AMP's file manager treats "" as the instance root. "." returns an empty listing on at
+// least some modules, which silently broke both root directory listings and the size
+// lookup used when reading root-level files such as server.properties.
+function normalizeAmpPath(value: string | undefined, fallback = "") {
+  return (value?.trim() || fallback).replace(/\\/g, "/").replace(/^\/+/, "");
 }
 
 function splitAmpPath(filePath: string) {
   const filename = normalizeAmpPath(filePath);
   const separator = filename.lastIndexOf("/");
-  if (separator === -1) return { dir: ".", name: filename };
-  return { dir: filename.slice(0, separator) || ".", name: filename.slice(separator + 1) };
+  if (separator === -1) return { dir: "", name: filename };
+  return { dir: filename.slice(0, separator), name: filename.slice(separator + 1) };
 }
 
 function fileEntryName(entry: AmpRecord) {
@@ -965,15 +1005,40 @@ async function writeFileContent(instance: AmpInstance, filePath: string, content
   return uploadViaTemporaryFile(instance, filePath, content, encoding, chunkSize);
 }
 
+// AMP offers no working append primitive, verified against 2.7.2:
+//   - FileManagerPlugin/AppendFileChunk returns Void and is a silent no-op; the call
+//     succeeds and the file is unchanged.
+//   - WriteFileChunk recreates the file, so writing at a non-zero Offset zero-fills
+//     everything before it rather than preserving the existing bytes.
+// So read the current contents and rewrite the file with the new data concatenated,
+// refusing rather than truncating when the file is too large to read back in full.
 async function appendFileContent(instance: AmpInstance, filePath: string, content: string, encoding: "utf8" | "base64") {
   const filename = normalizeAmpPath(filePath);
   const buffer = encoding === "base64" ? Buffer.from(content, "base64") : Buffer.from(content, "utf8");
-  const result = await callManagedMethod(instance, "FileManagerPlugin", "AppendFileChunk", {
-    Filename: filename,
-    Data: buffer.toString("base64"),
-    Delete: false,
-  });
-  return { filename, bytesAppended: buffer.length, result };
+  if (buffer.length === 0) return { filename, bytesAppended: 0, previousBytes: null, totalBytes: null, result: null };
+
+  // A file absent from its directory listing is a create, not an append.
+  const size = await findFileSize(instance, filename);
+  if (size === undefined) {
+    const created = await writeBufferContent(instance, filename, buffer);
+    return { filename, bytesAppended: buffer.length, previousBytes: 0, totalBytes: created.bytesWritten, created: true, result: created.result };
+  }
+
+  const existing = await readFileContent(instance, filename, defaultMaxReadBytes);
+  if (existing.truncated) {
+    throw new Error(
+      `Refusing to append to "${filename}": it is ${existing.sizeBytes ?? "more than"} bytes, larger than the ${defaultMaxReadBytes} byte read limit. AMP has no true append, so this tool must rewrite the whole file and would lose the unread remainder. Raise AMP_MAX_READ_BYTES to append to it.`,
+    );
+  }
+
+  const written = await writeBufferContent(instance, filename, Buffer.concat([existing.buffer, buffer]));
+  return {
+    filename,
+    bytesAppended: buffer.length,
+    previousBytes: existing.bytesRead,
+    totalBytes: written.bytesWritten,
+    result: written.result,
+  };
 }
 
 const postCreateActions: Record<string, number> = {
@@ -1024,12 +1089,13 @@ server.registerTool(
   "amp_configure",
   {
     description: "Set the AMP base URL and optional session ID for subsequent calls.",
-    inputSchema: {
+    annotations: { title: "Configure AMP connection", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    inputSchema: z.object({
       baseUrl: z.string().url().optional(),
       sessionId: z.string().optional(),
       policyEnabled: z.boolean().optional(),
       policyGroup: z.string().optional(),
-    },
+    }),
   },
   async (args) => {
     if (args.baseUrl) baseUrl = normalizeBaseUrl(args.baseUrl);
@@ -1043,13 +1109,35 @@ server.registerTool(
 server.registerTool(
   "amp_api_spec",
   {
-    description: "Return the AMP API spec. Optionally refresh from /API/Core/GetAPISpec.",
-    inputSchema: {
+    description: "Return the AMP API spec. Optionally refresh from /API/Core/GetAPISpec, or return the selected instance's own application modules.",
+    annotations: { title: "Get AMP API spec", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    inputSchema: z.object({
       refresh: z.boolean().optional(),
       moduleName: z.string().optional(),
-    },
+      fromManagedInstance: z
+        .boolean()
+        .optional()
+        .describe("Return the selected instance's own API spec (its application modules) instead of the controller's."),
+    }),
   },
-  async ({ refresh, moduleName }) => {
+  async ({ refresh, moduleName, fromManagedInstance }) => {
+    if (fromManagedInstance) {
+      if (!managedInstance) {
+        throw new Error("No instance is selected. Call amp_use_instance first to inspect an instance's own API spec.");
+      }
+      if (refresh) {
+        managedSpec = null;
+        managedSpecInstanceId = "";
+      }
+      const instanceSpec = (await getManagedSpec()) ?? {};
+      return textResult({
+        instance: summarizeInstance(managedInstance),
+        moduleName: moduleName ?? null,
+        module: moduleName ? (instanceSpec[moduleName] ?? null) : undefined,
+        availableModules: Object.keys(instanceSpec),
+        spec: moduleName ? undefined : instanceSpec,
+      });
+    }
     if (refresh) {
       cachedSpec = (await ampRequest("Core", "GetAPISpec")) as AmpSpec;
     }
@@ -1069,7 +1157,8 @@ server.registerTool(
   "amp_module_info",
   {
     description: "Call Core/GetModuleInfo.",
-    inputSchema: {},
+    annotations: { title: "Get AMP module info", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    inputSchema: z.object({}),
   },
   async () => textResult(await ampRequest("Core", "GetModuleInfo")),
 );
@@ -1078,7 +1167,8 @@ server.registerTool(
   "amp_policy_instances",
   {
     description: "List the AMP instances currently allowed by the MCP policy group, with non-secret diagnostics.",
-    inputSchema: {},
+    annotations: { title: "List policy-allowed instances", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    inputSchema: z.object({}),
   },
   async () => {
     const instances = await getPolicyInstances();
@@ -1090,10 +1180,7 @@ server.registerTool(
       policyEnabled,
       policyGroup,
       instances,
-      warning:
-        instances.length === 0
-          ? "No instances are visible in the policy group. Check that this MCP process received AMP_BASE_URL plus AMP_USERNAME/AMP_PASSWORD or AMP_SESSION_ID, and that the AMP user can see instances in AMP_POLICY_GROUP."
-          : undefined,
+      warning: instances.length === 0 ? await explainEmptyPolicyGroup() : undefined,
     });
   },
 );
@@ -1102,9 +1189,10 @@ server.registerTool(
   "amp_auth_requirements",
   {
     description: "Call Core/GetAuthenticationRequirements for a username.",
-    inputSchema: {
+    annotations: { title: "Get auth requirements", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    inputSchema: z.object({
       username: z.string().min(1),
-    },
+    }),
   },
   async ({ username }) => textResult(await ampRequest("Core", "GetAuthenticationRequirements", { username })),
 );
@@ -1113,12 +1201,13 @@ server.registerTool(
   "amp_login",
   {
     description: "Authenticate with Core/Login and store the returned session in memory. The session is redacted from output.",
-    inputSchema: {
+    annotations: { title: "Log in to AMP", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    inputSchema: z.object({
       username: z.string().min(1),
       password: z.string().min(1),
       token: z.string().optional().describe("Two-factor token/PIN if required."),
       rememberMe: z.boolean().optional(),
-    },
+    }),
   },
   async ({ username, password, token, rememberMe }) => {
     const result = await ampRequest("Core", "Login", {
@@ -1136,7 +1225,8 @@ server.registerTool(
   {
     description:
       "Authenticate using AMP_USERNAME, AMP_PASSWORD, optional AMP_TOKEN, and optional AMP_REMEMBER_ME from the process environment or .env. Credentials are never returned.",
-    inputSchema: {},
+    annotations: { title: "Log in from environment", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    inputSchema: z.object({}),
   },
   async () => {
     const username = process.env.AMP_USERNAME;
@@ -1159,7 +1249,8 @@ server.registerTool(
   "amp_clear_session",
   {
     description: "Forget the stored AMP session ID.",
-    inputSchema: {},
+    annotations: { title: "Clear cached AMP session", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    inputSchema: z.object({}),
   },
   async () => {
     sessionId = "";
@@ -1173,9 +1264,10 @@ server.registerTool(
   "amp_connection_status",
   {
     description: "Show non-secret AMP connection configuration and MCP policy state.",
-    inputSchema: {
+    annotations: { title: "Get connection status", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    inputSchema: z.object({
       checkInstances: z.boolean().optional().describe("Also count visible policy-group instances."),
-    },
+    }),
   },
   async ({ checkInstances }) => {
     const result: AmpRecord = {
@@ -1204,9 +1296,10 @@ server.registerTool(
   "amp_instances",
   {
     description: "List the policy-allowed AMP instances with friendly status summaries.",
-    inputSchema: {
+    annotations: { title: "List instances", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    inputSchema: z.object({
       raw: z.boolean().optional().describe("Include raw AMP instance/status payloads."),
-    },
+    }),
   },
   async ({ raw }) => textResult(await summarizePolicyInstances(raw ?? false)),
 );
@@ -1215,11 +1308,12 @@ server.registerTool(
   "amp_status",
   {
     description: "Show status for the selected instance, a named instance, or all policy-allowed instances.",
-    inputSchema: {
+    annotations: { title: "Get instance status", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    inputSchema: z.object({
       instance: z.string().optional().describe("Instance name, friendly name, or ID. Omit to use the selected instance."),
       all: z.boolean().optional().describe("Show every instance in the policy group."),
       raw: z.boolean().optional().describe("Include raw AMP instance/status payloads when showing all."),
-    },
+    }),
   },
   async ({ instance, all, raw }) => {
     if (all || (!instance && !managedInstance)) return textResult(await summarizePolicyInstances(raw ?? false));
@@ -1232,11 +1326,12 @@ server.registerTool(
   "amp_use_instance",
   {
     description: "Select an allowed AMP instance by name/friendly name/ID and prepare its managed API session.",
-    inputSchema: {
+    annotations: { title: "Select instance to manage", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    inputSchema: z.object({
       instance: z.string().min(1).describe("Instance name, friendly name, or ID. Partial names are okay if unique."),
       startIfStopped: z.boolean().optional().describe("Start the instance first if AMP cannot manage it while stopped."),
       waitTimeoutMs: z.number().int().positive().optional(),
-    },
+    }),
   },
   async ({ instance, startIfStopped, waitTimeoutMs }) => {
     const selected = await resolvePolicyInstance(instance, false);
@@ -1255,11 +1350,12 @@ server.registerTool(
   "amp_start_instance",
   {
     description: "Start a policy-allowed AMP instance by name/friendly name/ID, or the selected instance.",
-    inputSchema: {
+    annotations: { title: "Start instance", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    inputSchema: z.object({
       instance: z.string().optional(),
       wait: z.boolean().optional().describe("Wait until AMP reports the instance is running. Defaults to true."),
       waitTimeoutMs: z.number().int().positive().optional(),
-    },
+    }),
   },
   async ({ instance, wait, waitTimeoutMs }) => {
     const selected = await resolvePolicyInstance(instance, true);
@@ -1272,11 +1368,12 @@ server.registerTool(
   "amp_stop_instance",
   {
     description: "Stop a policy-allowed AMP instance by name/friendly name/ID, or the selected instance.",
-    inputSchema: {
+    annotations: { title: "Stop instance", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    inputSchema: z.object({
       instance: z.string().optional(),
       wait: z.boolean().optional().describe("Wait until AMP reports the instance is stopped. Defaults to true."),
       waitTimeoutMs: z.number().int().positive().optional(),
-    },
+    }),
   },
   async ({ instance, wait, waitTimeoutMs }) => {
     const selected = await resolvePolicyInstance(instance, true);
@@ -1293,11 +1390,12 @@ server.registerTool(
   "amp_restart_instance",
   {
     description: "Restart a policy-allowed AMP instance. If it is stopped, this starts it instead.",
-    inputSchema: {
+    annotations: { title: "Restart instance", readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    inputSchema: z.object({
       instance: z.string().optional(),
       wait: z.boolean().optional().describe("Wait until AMP reports the instance is running. Defaults to true."),
       waitTimeoutMs: z.number().int().positive().optional(),
-    },
+    }),
   },
   async ({ instance, wait, waitTimeoutMs }) => {
     const selected = await resolvePolicyInstance(instance, true);
@@ -1320,16 +1418,17 @@ server.registerTool(
   "amp_files_list",
   {
     description: "List files/folders for the selected or named policy-allowed instance.",
-    inputSchema: {
+    annotations: { title: "List instance files", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    inputSchema: z.object({
       path: z.string().optional().describe("AMP file-manager path. Defaults to the instance root."),
       instance: z.string().optional().describe("Instance name, friendly name, or ID. Omit to use the selected instance."),
       startIfStopped: z.boolean().optional().describe("Start the instance if needed. Defaults to true."),
       waitTimeoutMs: z.number().int().positive().optional(),
-    },
+    }),
   },
   async ({ path: dir, instance, startIfStopped, waitTimeoutMs }) => {
     const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
-    const listing = await listDirectory(selected, dir ?? ".");
+    const listing = await listDirectory(selected, dir ?? "");
     return textResult({ instance: summarizeInstance(selected), ...listing });
   },
 );
@@ -1338,7 +1437,8 @@ server.registerTool(
   "amp_file_read",
   {
     description: "Read a file from the selected or named policy-allowed instance using AMP's file manager.",
-    inputSchema: {
+    annotations: { title: "Read instance file", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    inputSchema: z.object({
       path: z.string().min(1).describe("AMP file-manager path to read."),
       instance: z.string().optional().describe("Instance name, friendly name, or ID. Omit to use the selected instance."),
       encoding: z.enum(["utf8", "base64"]).optional().describe("Return text as utf8 or raw base64. Defaults to utf8."),
@@ -1346,7 +1446,7 @@ server.registerTool(
       chunkSize: z.number().int().positive().optional().describe("Read chunk size in bytes."),
       startIfStopped: z.boolean().optional().describe("Start the instance if needed. Defaults to true."),
       waitTimeoutMs: z.number().int().positive().optional(),
-    },
+    }),
   },
   async ({ path: filePath, instance, encoding, maxBytes, chunkSize, startIfStopped, waitTimeoutMs }) => {
     const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
@@ -1367,7 +1467,8 @@ server.registerTool(
   "amp_file_write",
   {
     description: "Overwrite a file on the selected or named policy-allowed instance using AMP's file manager.",
-    inputSchema: {
+    annotations: { title: "Write instance file (overwrites)", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    inputSchema: z.object({
       path: z.string().min(1).describe("AMP file-manager path to write."),
       content: z.string().describe("File content. Interpreted as UTF-8 unless encoding is base64."),
       instance: z.string().optional().describe("Instance name, friendly name, or ID. Omit to use the selected instance."),
@@ -1375,7 +1476,7 @@ server.registerTool(
       chunkSize: z.number().int().positive().optional(),
       startIfStopped: z.boolean().optional().describe("Start the instance if needed. Defaults to true."),
       waitTimeoutMs: z.number().int().positive().optional(),
-    },
+    }),
   },
   async ({ path: filePath, content, instance, encoding, chunkSize, startIfStopped, waitTimeoutMs }) => {
     const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
@@ -1388,14 +1489,15 @@ server.registerTool(
   "amp_file_append",
   {
     description: "Append text or base64 data to a file on the selected or named policy-allowed instance.",
-    inputSchema: {
+    annotations: { title: "Append to instance file", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    inputSchema: z.object({
       path: z.string().min(1).describe("AMP file-manager path to append."),
       content: z.string().describe("Content to append. Interpreted as UTF-8 unless encoding is base64."),
       instance: z.string().optional().describe("Instance name, friendly name, or ID. Omit to use the selected instance."),
       encoding: z.enum(["utf8", "base64"]).optional(),
       startIfStopped: z.boolean().optional().describe("Start the instance if needed. Defaults to true."),
       waitTimeoutMs: z.number().int().positive().optional(),
-    },
+    }),
   },
   async ({ path: filePath, content, instance, encoding, startIfStopped, waitTimeoutMs }) => {
     const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
@@ -1408,21 +1510,39 @@ server.registerTool(
   "amp_file_rename",
   {
     description: "Rename a file on the selected or named policy-allowed instance.",
-    inputSchema: {
+    annotations: { title: "Rename instance file", readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    inputSchema: z.object({
       path: z.string().min(1).describe("Current AMP file-manager path."),
-      newPath: z.string().min(1).describe("New AMP file-manager path."),
+      newPath: z
+        .string()
+        .min(1)
+        .describe("New name for the file, or a path in the same directory. Renaming cannot move a file between directories."),
       instance: z.string().optional().describe("Instance name, friendly name, or ID. Omit to use the selected instance."),
       startIfStopped: z.boolean().optional().describe("Start the instance if needed. Defaults to true."),
       waitTimeoutMs: z.number().int().positive().optional(),
-    },
+    }),
   },
   async ({ path: filePath, newPath, instance, startIfStopped, waitTimeoutMs }) => {
     const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
+    const from = normalizeAmpPath(filePath);
+    const target = splitAmpPath(normalizeAmpPath(newPath));
+    const source = splitAmpPath(from);
+
+    // AMP resolves NewFilename relative to the source file's own directory, so passing a
+    // full path double-prefixes it ("dir/dir/new.txt") and the rename fails. Send the bare
+    // name, and reject a different directory rather than silently renaming in place.
+    if (target.dir !== "" && target.dir !== source.dir) {
+      throw new Error(
+        `Cannot rename "${from}" to "${normalizeAmpPath(newPath)}": AMP's RenameFile only renames within a directory and cannot move files. Copy to the new directory with amp_file_copy, then trash the original.`,
+      );
+    }
+
     const result = await callManagedMethod(selected, "FileManagerPlugin", "RenameFile", {
-      Filename: normalizeAmpPath(filePath),
-      NewFilename: normalizeAmpPath(newPath),
+      Filename: from,
+      NewFilename: target.name,
     });
-    return textResult({ instance: summarizeInstance(selected), path: normalizeAmpPath(filePath), newPath: normalizeAmpPath(newPath), result });
+    const renamedTo = source.dir ? `${source.dir}/${target.name}` : target.name;
+    return textResult({ instance: summarizeInstance(selected), path: from, newPath: renamedTo, result });
   },
 );
 
@@ -1430,13 +1550,14 @@ server.registerTool(
   "amp_file_copy",
   {
     description: "Copy a file into another directory on the selected or named policy-allowed instance.",
-    inputSchema: {
+    annotations: { title: "Copy instance file", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    inputSchema: z.object({
       path: z.string().min(1).describe("Source AMP file-manager path."),
       targetDirectory: z.string().min(1).describe("Destination directory path."),
       instance: z.string().optional().describe("Instance name, friendly name, or ID. Omit to use the selected instance."),
       startIfStopped: z.boolean().optional().describe("Start the instance if needed. Defaults to true."),
       waitTimeoutMs: z.number().int().positive().optional(),
-    },
+    }),
   },
   async ({ path: filePath, targetDirectory, instance, startIfStopped, waitTimeoutMs }) => {
     const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
@@ -1452,12 +1573,13 @@ server.registerTool(
   "amp_file_trash",
   {
     description: "Move a file to AMP trash on the selected or named policy-allowed instance.",
-    inputSchema: {
+    annotations: { title: "Move instance file to trash", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    inputSchema: z.object({
       path: z.string().min(1).describe("AMP file-manager path to trash."),
       instance: z.string().optional().describe("Instance name, friendly name, or ID. Omit to use the selected instance."),
       startIfStopped: z.boolean().optional().describe("Start the instance if needed. Defaults to true."),
       waitTimeoutMs: z.number().int().positive().optional(),
-    },
+    }),
   },
   async ({ path: filePath, instance, startIfStopped, waitTimeoutMs }) => {
     const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
@@ -1471,12 +1593,13 @@ server.registerTool(
   "amp_directory_create",
   {
     description: "Create a directory on the selected or named policy-allowed instance.",
-    inputSchema: {
+    annotations: { title: "Create instance directory", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    inputSchema: z.object({
       path: z.string().min(1).describe("AMP file-manager directory path to create."),
       instance: z.string().optional().describe("Instance name, friendly name, or ID. Omit to use the selected instance."),
       startIfStopped: z.boolean().optional().describe("Start the instance if needed. Defaults to true."),
       waitTimeoutMs: z.number().int().positive().optional(),
-    },
+    }),
   },
   async ({ path: dirPath, instance, startIfStopped, waitTimeoutMs }) => {
     const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
@@ -1490,13 +1613,14 @@ server.registerTool(
   "amp_directory_rename",
   {
     description: "Rename a directory on the selected or named policy-allowed instance.",
-    inputSchema: {
+    annotations: { title: "Rename instance directory", readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    inputSchema: z.object({
       path: z.string().min(1).describe("Current AMP file-manager directory path."),
       newName: z.string().min(1).describe("New directory name only, not a full path."),
       instance: z.string().optional().describe("Instance name, friendly name, or ID. Omit to use the selected instance."),
       startIfStopped: z.boolean().optional().describe("Start the instance if needed. Defaults to true."),
       waitTimeoutMs: z.number().int().positive().optional(),
-    },
+    }),
   },
   async ({ path: dirPath, newName, instance, startIfStopped, waitTimeoutMs }) => {
     const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
@@ -1512,12 +1636,13 @@ server.registerTool(
   "amp_directory_trash",
   {
     description: "Move a directory to AMP trash on the selected or named policy-allowed instance.",
-    inputSchema: {
+    annotations: { title: "Move directory to trash", readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    inputSchema: z.object({
       path: z.string().min(1).describe("AMP file-manager directory path to trash."),
       instance: z.string().optional().describe("Instance name, friendly name, or ID. Omit to use the selected instance."),
       startIfStopped: z.boolean().optional().describe("Start the instance if needed. Defaults to true."),
       waitTimeoutMs: z.number().int().positive().optional(),
-    },
+    }),
   },
   async ({ path: dirPath, instance, startIfStopped, waitTimeoutMs }) => {
     const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
@@ -1531,11 +1656,12 @@ server.registerTool(
   "amp_console_read",
   {
     description: "Read recent console/status updates from the selected or named policy-allowed instance.",
-    inputSchema: {
+    annotations: { title: "Read instance console", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    inputSchema: z.object({
       instance: z.string().optional().describe("Instance name, friendly name, or ID. Omit to use the selected instance."),
       startIfStopped: z.boolean().optional().describe("Start the instance if needed. Defaults to true."),
       waitTimeoutMs: z.number().int().positive().optional(),
-    },
+    }),
   },
   async ({ instance, startIfStopped, waitTimeoutMs }) => {
     const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
@@ -1547,12 +1673,13 @@ server.registerTool(
   "amp_console_send",
   {
     description: "Send a console command/message to the selected or named policy-allowed instance.",
-    inputSchema: {
+    annotations: { title: "Send console command", readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    inputSchema: z.object({
       message: z.string().min(1),
       instance: z.string().optional().describe("Instance name, friendly name, or ID. Omit to use the selected instance."),
       startIfStopped: z.boolean().optional().describe("Start the instance if needed. Defaults to true."),
       waitTimeoutMs: z.number().int().positive().optional(),
-    },
+    }),
   },
   async ({ message, instance, startIfStopped, waitTimeoutMs }) => {
     const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
@@ -1565,9 +1692,10 @@ server.registerTool(
   "amp_supported_apps",
   {
     description: "List AMP-supported application modules that can be used when creating instances.",
-    inputSchema: {
+    annotations: { title: "List supported applications", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    inputSchema: z.object({
       full: z.boolean().optional().describe("Return full application records instead of summaries."),
-    },
+    }),
   },
   async ({ full }) => {
     const method = full ? "GetSupportedApplications" : "GetSupportedAppSummaries";
@@ -1579,7 +1707,8 @@ server.registerTool(
   "amp_create_instance",
   {
     description: `Create a new AMP instance in the configured policy group (${policyGroup}). Auto-configured by default.`,
-    inputSchema: {
+    annotations: { title: "Create new instance", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    inputSchema: z.object({
       module: z.string().min(1).describe("AMP module name, for example Minecraft, Valheim, or any module reported by amp_supported_apps."),
       friendlyName: z.string().min(1).describe("Human-friendly display name for the new instance."),
       instanceName: z.string().optional().describe("Internal instance name. Defaults to a safe name generated from friendlyName."),
@@ -1595,7 +1724,7 @@ server.registerTool(
       startOnBoot: z.boolean().optional(),
       displayImageSource: z.string().optional(),
       targetDatastore: z.number().int().optional(),
-    },
+    }),
   },
   async (args) => {
     const autoConfigure = args.autoConfigure ?? true;
@@ -1642,13 +1771,15 @@ server.registerTool(
 server.registerTool(
   "amp_call",
   {
-    description: "Call any method from the captured/refreshed AMP API spec.",
-    inputSchema: {
+    description:
+      "Call any method from the AMP API spec. Non-ADSModule calls are routed to the selected instance, so after amp_use_instance this also reaches that instance's own application modules (MinecraftModule, GenericModule, ...). Use amp_api_spec with fromManagedInstance to discover them.",
+    annotations: { title: "Call any AMP API method", readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    inputSchema: z.object({
       moduleName: z.string().min(1),
       methodName: z.string().min(1),
       params: z.record(z.string(), z.unknown()).optional(),
       confirm: z.boolean().optional().describe("Required for state-changing methods."),
-    },
+    }),
   },
   async ({ moduleName, methodName, params, confirm }) => {
     const { meta, refreshed, refreshError } = await resolveMethodMeta(moduleName, methodName);
@@ -1674,7 +1805,36 @@ server.registerTool(
   },
 );
 
+// AMP returns an empty listing for a "." root instead of an error, so a regression here
+// is silent. Assert the root forms all collapse to "".
+function checkPathHandling() {
+  const cases: Array<[string | undefined, string]> = [
+    [undefined, ""],
+    ["", ""],
+    ["/", ""],
+    [".", "."],
+    ["  ", ""],
+    ["/cfg/server.cfg", "cfg/server.cfg"],
+    ["cfg\\server.cfg", "cfg/server.cfg"],
+  ];
+  for (const [input, expected] of cases) {
+    const actual = normalizeAmpPath(input);
+    if (actual !== expected) {
+      throw new Error(`normalizeAmpPath(${JSON.stringify(input)}) returned ${JSON.stringify(actual)}, expected ${JSON.stringify(expected)}`);
+    }
+  }
+  const root = splitAmpPath("server.properties");
+  if (root.dir !== "" || root.name !== "server.properties") {
+    throw new Error(`splitAmpPath("server.properties") returned ${JSON.stringify(root)}; root-level files must use dir "".`);
+  }
+  const nested = splitAmpPath("/cfg/server.cfg");
+  if (nested.dir !== "cfg" || nested.name !== "server.cfg") {
+    throw new Error(`splitAmpPath("/cfg/server.cfg") returned ${JSON.stringify(nested)}.`);
+  }
+}
+
 async function selfTest() {
+  checkPathHandling();
   const modules = Object.keys(cachedSpec);
   const methods = modules.reduce((sum, moduleName) => sum + Object.keys(cachedSpec[moduleName] ?? {}).length, 0);
   const result: Record<string, unknown> = {
@@ -1710,9 +1870,14 @@ async function main() {
     await selfTest();
     return;
   }
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  const handle = serveStdio(() => server);
   console.error(`amp-http-mcp-server connected for ${baseUrl}`);
+  const shutdown = async () => {
+    await handle.close();
+    process.exit(0);
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
 }
 
 main().catch((error: unknown) => {
