@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
-import os from "node:os";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/server";
@@ -14,7 +13,7 @@ type AmpParameter = {
   TypeName: string;
   Description?: string;
   Optional: boolean;
-  ParamEnumValues?: string[] | null;
+  ParamEnumValues?: Record<string, string | number> | null;
 };
 
 type AmpMethod = {
@@ -44,25 +43,42 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
 loadEnvFile(path.join(projectRoot, ".env"));
 
-const server = new McpServer({
-  name: "amp-http-mcp-server",
-  version: "1.0.0",
-});
-
 let baseUrl = normalizeBaseUrl(process.env.AMP_BASE_URL ?? "https://amp.example.com");
 let sessionId = process.env.AMP_SESSION_ID ?? "";
+let loginCredentials = {
+  username: process.env.AMP_USERNAME ?? "",
+  password: process.env.AMP_PASSWORD ?? "",
+  token: process.env.AMP_TOKEN ?? "",
+};
 let cachedSpec: AmpSpec = fallbackSpec as AmpSpec;
 let policyEnabled = process.env.AMP_POLICY_ENABLED !== "false";
 let policyGroup = process.env.AMP_POLICY_GROUP ?? "AI";
-let envLoginAttempted = false;
+const policyLocked = process.env.AMP_POLICY_LOCKED !== "false";
+const protectedInstanceSelectors = new Set(
+  (process.env.AMP_PROTECTED_INSTANCES ?? "")
+    .split(",")
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean),
+);
 let managedInstance: AmpInstance | null = null;
-let managedSessionId = "";
+const managedSessions = new Map<string, string>();
+let controllerLoginPromise: Promise<void> | null = null;
+const managedLoginPromises = new Map<string, Promise<void>>();
 
-const defaultWaitTimeoutMs = Number(process.env.AMP_WAIT_TIMEOUT_MS ?? 120000);
-const defaultPollMs = Number(process.env.AMP_POLL_MS ?? 3000);
-const defaultManagedLoginTimeoutMs = Number(process.env.AMP_MANAGED_LOGIN_TIMEOUT_MS ?? 90000);
-const defaultFileChunkBytes = Number(process.env.AMP_FILE_CHUNK_BYTES ?? 524288);
-const defaultMaxReadBytes = Number(process.env.AMP_MAX_READ_BYTES ?? 1048576);
+function positiveEnvNumber(name: string, fallback: number, integer = false, max = Number.POSITIVE_INFINITY) {
+  const value = Number(process.env[name] ?? fallback);
+  if (!Number.isFinite(value) || value <= 0 || value > max || (integer && !Number.isInteger(value))) {
+    throw new Error(`${name} must be a positive${integer ? " integer" : " number"}${Number.isFinite(max) ? ` no greater than ${max}` : ""}.`);
+  }
+  return value;
+}
+
+const defaultWaitTimeoutMs = positiveEnvNumber("AMP_WAIT_TIMEOUT_MS", 120000);
+const defaultPollMs = positiveEnvNumber("AMP_POLL_MS", 3000);
+const defaultManagedLoginTimeoutMs = positiveEnvNumber("AMP_MANAGED_LOGIN_TIMEOUT_MS", 90000);
+const defaultFileChunkBytes = positiveEnvNumber("AMP_FILE_CHUNK_BYTES", 524288, true);
+const defaultMaxReadBytes = positiveEnvNumber("AMP_MAX_READ_BYTES", 1048576, true);
+const defaultHttpTimeoutMs = positiveEnvNumber("AMP_HTTP_TIMEOUT_MS", 30000, true, 4294967295);
 
 function loadEnvFile(filePath: string) {
   if (!existsSync(filePath)) return;
@@ -123,6 +139,14 @@ function redact(value: unknown): unknown {
   return value;
 }
 
+function redactErrorText(value: string) {
+  let output = value;
+  for (const secret of [sessionId, ...managedSessions.values(), loginCredentials.password, loginCredentials.token]) {
+    if (secret) output = output.replaceAll(secret, "<redacted>");
+  }
+  return output.slice(0, 2000);
+}
+
 function findMethodMeta(moduleName: string, methodName: string) {
   return cachedSpec[moduleName]?.[methodName] ?? null;
 }
@@ -130,30 +154,54 @@ function findMethodMeta(moduleName: string, methodName: string) {
 // An application instance exposes its own modules (MinecraftModule, GenericModule,
 // srcdsModule, ...) that the ADS controller spec never lists. Cache the managed
 // instance's spec keyed by instance ID so switching instances invalidates it.
-let managedSpec: AmpSpec | null = null;
-let managedSpecInstanceId = "";
+const managedSpecs = new Map<string, AmpSpec>();
 
-async function getManagedSpec() {
-  if (!managedInstance) return null;
-  const id = instanceIdOf(managedInstance);
-  if (!id) return null;
-  if (managedSpec && managedSpecInstanceId === id) return managedSpec;
-  managedSpec = (await ampRequest("Core", "GetAPISpec", {}, managedInstance)) as AmpSpec;
-  managedSpecInstanceId = id;
-  return managedSpec;
+function resetConnectionState(clearControllerSession = true) {
+  if (clearControllerSession) sessionId = "";
+  cachedSpec = fallbackSpec as AmpSpec;
+  controllerLoginPromise = null;
+  managedInstance = null;
+  managedSessions.clear();
+  managedLoginPromises.clear();
+  managedSpecs.clear();
+  loginCredentials = {
+    username: process.env.AMP_USERNAME ?? "",
+    password: process.env.AMP_PASSWORD ?? "",
+    token: process.env.AMP_TOKEN ?? "",
+  };
 }
 
-async function resolveMethodMeta(moduleName: string, methodName: string) {
+async function getManagedSpec(instance = managedInstance) {
+  if (!instance) return null;
+  const id = instanceIdOf(instance);
+  if (!id) return null;
+  const cached = managedSpecs.get(id);
+  if (cached) return cached;
+  const spec = (await ampRequest("Core", "GetAPISpec", {}, instance)) as AmpSpec;
+  managedSpecs.set(id, spec);
+  return spec;
+}
+
+async function resolveMethodMeta(moduleName: string, methodName: string, instance: AmpInstance | null) {
+  if (instance) {
+    try {
+      const spec = await getManagedSpec(instance);
+      return { meta: spec?.[moduleName]?.[methodName] ?? null, refreshed: true, refreshError: "" };
+    } catch (error) {
+      return { meta: null, refreshed: false, refreshError: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
   let meta = findMethodMeta(moduleName, methodName);
   if (meta) return { meta, refreshed: false, refreshError: "" };
 
   try {
-    cachedSpec = (await ampRequest("Core", "GetAPISpec")) as AmpSpec;
+    await ensureSession("Core", "GetAPISpec");
+    cachedSpec = await refreshControllerSpec();
     meta = findMethodMeta(moduleName, methodName);
     if (meta) return { meta, refreshed: true, refreshError: "" };
 
-    const instanceSpec = await getManagedSpec();
-    return { meta: instanceSpec?.[moduleName]?.[methodName] ?? null, refreshed: true, refreshError: "" };
+    return { meta: null, refreshed: true, refreshError: "" };
   } catch (error) {
     return {
       meta: null,
@@ -164,6 +212,7 @@ async function resolveMethodMeta(moduleName: string, methodName: string) {
 }
 
 function coerceValue(parameter: AmpParameter, value: unknown) {
+  if (value === null && parameter.TypeName.startsWith("Nullable<")) return null;
   if (value === undefined || value === null) {
     if (parameter.Optional) return undefined;
     throw new Error(`Missing required parameter "${parameter.Name}" (${parameter.TypeName}).`);
@@ -197,6 +246,7 @@ function normalizeParams(meta: AmpMethod, params: Record<string, unknown>) {
 function requiresConfirmation(moduleName: string, methodName: string) {
   const name = `${moduleName}/${methodName}`.toLowerCase();
   const method = methodName.toLowerCase();
+  if (["adsmodule/gettargetpairingcode", "core/getremotelogintoken"].includes(name)) return true;
   const readOnlyCalls = new Set([
     "adsmodule/getinstances",
     "adsmodule/getinstance",
@@ -238,19 +288,20 @@ function shouldSkipEnvLogin(moduleName: string, methodName: string) {
 }
 
 async function ensureSession(moduleName: string, methodName: string) {
-  if (shouldSkipEnvLogin(moduleName, methodName) || envLoginAttempted) return;
+  if (shouldSkipEnvLogin(moduleName, methodName)) return;
+  if (controllerLoginPromise) return controllerLoginPromise;
 
-  const username = process.env.AMP_USERNAME;
-  const password = process.env.AMP_PASSWORD;
+  const { username, password, token } = loginCredentials;
   if (!username || !password) return;
 
-  envLoginAttempted = true;
-  await ampRequest("Core", "Login", {
-    username,
-    password,
-    token: process.env.AMP_TOKEN ?? "",
-    rememberMe: process.env.AMP_REMEMBER_ME === "true",
-  });
+  controllerLoginPromise = loginAndRefresh({ username, password, token, rememberMe: process.env.AMP_REMEMBER_ME === "true" }).then(
+    () => undefined,
+  );
+  try {
+    await controllerLoginPromise;
+  } finally {
+    controllerLoginPromise = null;
+  }
 }
 
 function instanceIdOf(instance: AmpInstance | null) {
@@ -258,33 +309,41 @@ function instanceIdOf(instance: AmpInstance | null) {
 }
 
 async function ensureManagedSession(instance: AmpInstance, timeoutMs = defaultManagedLoginTimeoutMs) {
-  if (managedSessionId) return;
+  const id = instanceIdOf(instance);
+  if (!id) throw new Error("Cannot create a managed session without an instance ID.");
+  if (managedSessions.has(id)) return;
+  const inFlight = managedLoginPromises.get(id);
+  if (inFlight) return inFlight;
 
-  const username = process.env.AMP_USERNAME;
-  const password = process.env.AMP_PASSWORD;
-  if (!username || !password) {
-    throw new Error("Managed instance API calls require AMP_USERNAME and AMP_PASSWORD.");
+  const login = (async () => {
+    const { username, password, token } = loginCredentials;
+    if (!username || !password) {
+      throw new Error("Managed instance API calls require AMP_USERNAME and AMP_PASSWORD.");
+    }
+
+    const deadline = Date.now() + timeoutMs;
+    let lastError = "";
+
+    while (Date.now() <= deadline) {
+      try {
+        const result = await ampRequest("Core", "Login", { username, password, token, rememberMe: false }, instance);
+        if (!isAmpError(result) && !isActionFailure(result) && managedSessions.has(id)) return;
+        lastError = getAmpErrorMessage(result) || actionMessage(result) || JSON.stringify(redact(result));
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error);
+      }
+      await sleep(defaultPollMs);
+    }
+
+    const name = instance.FriendlyName ?? instance.InstanceName ?? instanceIdOf(instance);
+    throw new Error(`Could not log in to managed AMP instance "${name}" within ${timeoutMs}ms. Last response: ${lastError}`);
+  })();
+  managedLoginPromises.set(id, login);
+  try {
+    await login;
+  } finally {
+    managedLoginPromises.delete(id);
   }
-
-  const deadline = Date.now() + timeoutMs;
-  let lastError = "";
-
-  while (Date.now() <= deadline) {
-    const result = await ampRequest("Core", "Login", {
-      username,
-      password,
-      token: process.env.AMP_TOKEN ?? "",
-      rememberMe: false,
-    }, instance);
-
-    if (!isAmpError(result) && !isActionFailure(result) && managedSessionId) return;
-
-    lastError = getAmpErrorMessage(result) || actionMessage(result) || JSON.stringify(redact(result));
-    await sleep(defaultPollMs);
-  }
-
-  const name = instance.FriendlyName ?? instance.InstanceName ?? instanceIdOf(instance);
-  throw new Error(`Could not log in to managed AMP instance "${name}" within ${timeoutMs}ms. Last response: ${lastError}`);
 }
 
 async function ampRequest(
@@ -297,6 +356,7 @@ async function ampRequest(
     const id = instanceIdOf(instance);
     if (!id) throw new Error("Cannot make managed instance request without an instance ID.");
     if (methodName !== "Login") await ensureManagedSession(instance);
+    const managedSessionId = managedSessions.get(id) ?? "";
 
     const url = `${baseUrl}/API/ADSModule/Servers/${encodeURIComponent(id)}/API/${encodeURIComponent(moduleName)}/${encodeURIComponent(methodName)}`;
     const body = { ...params, SESSIONID: managedSessionId };
@@ -307,6 +367,7 @@ async function ampRequest(
         "Accept": "application/json",
         "Authorization": `Bearer ${managedSessionId || sessionId}`,
       },
+      signal: AbortSignal.timeout(defaultHttpTimeoutMs),
       body: JSON.stringify(body),
     });
 
@@ -320,14 +381,14 @@ async function ampRequest(
     }
 
     if (authHeader?.startsWith("Bearer ")) {
-      managedSessionId = authHeader.slice("Bearer ".length);
+      managedSessions.set(id, authHeader.slice("Bearer ".length));
     }
     if (data && typeof data === "object" && "sessionID" in data && typeof data.sessionID === "string") {
-      managedSessionId = data.sessionID;
+      managedSessions.set(id, data.sessionID);
     }
 
     if (!response.ok) {
-      throw new Error(`AMP HTTP ${response.status}: ${text}`);
+      throw new Error(`AMP HTTP ${response.status}: ${redactErrorText(text)}`);
     }
 
     return data;
@@ -344,6 +405,7 @@ async function ampRequest(
       "Accept": "application/json",
       "Authorization": `Bearer ${sessionId}`,
     },
+    signal: AbortSignal.timeout(defaultHttpTimeoutMs),
     body: JSON.stringify(body),
   });
 
@@ -364,10 +426,39 @@ async function ampRequest(
   }
 
   if (!response.ok) {
-    throw new Error(`AMP HTTP ${response.status}: ${text}`);
+    throw new Error(`AMP HTTP ${response.status}: ${redactErrorText(text)}`);
   }
 
   return data;
+}
+
+function asAmpSpec(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("AMP returned an invalid API spec.");
+  }
+  const spec = value as AmpSpec;
+  if (!spec.Core?.GetAPISpec) {
+    throw new Error("AMP returned an incomplete API spec; keeping the existing authenticated/fallback catalog.");
+  }
+  return spec;
+}
+
+async function refreshControllerSpec() {
+  if (!sessionId) {
+    throw new Error("Authenticate before refreshing the full AMP API spec.");
+  }
+  const result = await ampRequest("Core", "GetAPISpec");
+  assertAmpAccepted("Core/GetAPISpec", result);
+  return asAmpSpec(result);
+}
+
+async function loginAndRefresh(params: { username: string; password: string; token: string; rememberMe: boolean }) {
+  const result = await ampRequest("Core", "Login", params);
+  assertAmpAccepted("Core/Login", result);
+  if (!sessionId) throw new Error("AMP accepted the login request but returned no session ID.");
+  loginCredentials = { username: params.username, password: params.password, token: params.token };
+  cachedSpec = await refreshControllerSpec();
+  return result;
 }
 
 function isAmpError(value: unknown) {
@@ -469,32 +560,38 @@ function getParam(params: Record<string, unknown>, ...names: string[]) {
   return found?.[1];
 }
 
-async function assertPolicyAllows(moduleName: string, methodName: string, params: Record<string, unknown>) {
+async function assertPolicyAllows(
+  moduleName: string,
+  methodName: string,
+  params: Record<string, unknown>,
+  managedContext: AmpInstance | null = managedInstance,
+) {
   if (!policyEnabled) return params;
 
   const callName = `${moduleName}/${methodName}`.toLowerCase();
+  const stateChanging = requiresConfirmation(moduleName, methodName);
   if (moduleName === "FileManagerPlugin") {
-    if (!managedInstance) {
+    if (!managedContext) {
       throw new Error(
         `Policy blocked ${moduleName}/${methodName}: call ADSModule/ManageInstance for an instance in display group "${policyGroup}" first.`,
       );
     }
 
-    const moduleInfo = await ampRequest("Core", "GetModuleInfo", {}, managedInstance);
+    const moduleInfo = await ampRequest("Core", "GetModuleInfo", {}, managedContext);
     const currentInstanceId =
       moduleInfo && typeof moduleInfo === "object" && "InstanceId" in moduleInfo
         ? String(moduleInfo.InstanceId)
         : "";
     const policyInstances = await getPolicyInstances();
-    const allowed = policyInstances.some((instance) => {
+    const allowed = policyInstances.find((instance) => {
       const id = instance.InstanceID ?? instance.InstanceId;
       return id && String(id).toLowerCase() === currentInstanceId.toLowerCase();
     });
 
     if (!allowed) {
-      if (managedInstance) {
+      if (managedContext) {
         throw new Error(
-          `Policy blocked ${moduleName}/${methodName}: AMP returned a management handoff for "${managedInstance.InstanceName}", but the controller API did not switch into a usable instance session. Direct/proxied instance API access is required before file-manager calls can be made safely.`,
+          `Policy blocked ${moduleName}/${methodName}: AMP returned a management handoff for "${managedContext.InstanceName}", but the controller API did not switch into a usable instance session. Direct/proxied instance API access is required before file-manager calls can be made safely.`,
         );
       }
       throw new Error(
@@ -502,21 +599,46 @@ async function assertPolicyAllows(moduleName: string, methodName: string, params
       );
     }
 
+    if (stateChanging && isProtectedInstance(allowed)) {
+      throw new Error(`Policy blocked ${moduleName}/${methodName}: "${instanceLabel(allowed)}" is protected by AMP_PROTECTED_INSTANCES.`);
+    }
+
     return params;
   }
 
-  if (moduleName !== "ADSModule") return params;
+  if (moduleName !== "ADSModule") {
+    if (!managedContext) {
+      if (stateChanging) {
+        throw new Error(`Policy blocked controller-wide state-changing call ${moduleName}/${methodName}; select an allowed instance first.`);
+      }
+      return params;
+    }
 
-  if (["adsmodule/createinstance", "adsmodule/createinstancefromspec", "adsmodule/deploytemplate"].includes(callName)) {
-    return { ...params, Group: policyGroup, DisplayGroup: policyGroup };
+    const current = (await getPolicyInstances()).find((instance) => sameInstance(instance, managedContext));
+    if (!current) {
+      throw new Error(`Policy blocked ${moduleName}/${methodName}: the selected instance is no longer in display group "${policyGroup}".`);
+    }
+    if (stateChanging && isProtectedInstance(current)) {
+      throw new Error(`Policy blocked ${moduleName}/${methodName}: "${instanceLabel(current)}" is protected by AMP_PROTECTED_INSTANCES.`);
+    }
+    return params;
+  }
+
+  if (["adsmodule/createinstance", "adsmodule/createinstancefromspec"].includes(callName)) {
+    return { ...params, Group: policyGroup };
   }
 
   const targetId = getParam(params, "InstanceID", "InstanceId", "instanceId", "SourceInstanceId");
   const targetName = getParam(params, "InstanceName", "instanceName");
-  if (!targetId && !targetName) return params;
+  if (!targetId && !targetName) {
+    if (stateChanging) {
+      throw new Error(`Policy blocked global or aggregate state-changing call ${moduleName}/${methodName}; it cannot be scoped to display group "${policyGroup}".`);
+    }
+    return params;
+  }
 
   const policyInstances = await getPolicyInstances();
-  const allowed = policyInstances.some((instance) => {
+  const allowed = policyInstances.find((instance) => {
     const id = instance.InstanceID ?? instance.InstanceId;
     return (
       (targetId && String(id).toLowerCase() === String(targetId).toLowerCase()) ||
@@ -526,6 +648,10 @@ async function assertPolicyAllows(moduleName: string, methodName: string, params
 
   if (!allowed) {
     throw new Error(`Policy blocked ${moduleName}/${methodName}: target is not in display group "${policyGroup}".`);
+  }
+
+  if (stateChanging && callName !== "adsmodule/manageinstance" && isProtectedInstance(allowed)) {
+    throw new Error(`Policy blocked ${moduleName}/${methodName}: "${instanceLabel(allowed)}" is protected by AMP_PROTECTED_INSTANCES.`);
   }
 
   if (methodName === "UpdateInstanceInfo") {
@@ -539,7 +665,6 @@ async function updateManagedInstance(moduleName: string, methodName: string, par
   if (moduleName !== "ADSModule" || methodName !== "ManageInstance" || isAmpError(result)) return;
   if (!result || typeof result !== "object" || !("Status" in result) || (result as { Status?: unknown }).Status !== true) {
     managedInstance = null;
-    managedSessionId = "";
     return;
   }
 
@@ -554,7 +679,6 @@ async function updateManagedInstance(moduleName: string, methodName: string, par
         (targetName && String(instance.InstanceName).toLowerCase() === String(targetName).toLowerCase())
       );
     }) ?? null;
-  managedSessionId = "";
 }
 
 function instanceLabel(instance: AmpInstance | null) {
@@ -572,6 +696,10 @@ function instanceNameOrThrow(instance: AmpInstance) {
 function matchFields(instance: AmpInstance) {
   return [instanceIdOf(instance), instance.InstanceName, instance.FriendlyName]
     .filter((value): value is string => typeof value === "string" && value.length > 0);
+}
+
+function isProtectedInstance(instance: AmpInstance | null | undefined) {
+  return Boolean(instance && matchFields(instance).some((field) => protectedInstanceSelectors.has(field.toLowerCase())));
 }
 
 function sameInstance(left: AmpInstance, right: AmpInstance) {
@@ -611,7 +739,7 @@ function runningFromRecord(record: AmpRecord | null | undefined) {
   const state = pickString(record, "State", "Status", "AppState", "ApplicationState", "DaemonState")?.toLowerCase();
   if (!state) return undefined;
   if (/(stopped|offline|not running|notrunning|failed|unavailable)/.test(state)) return false;
-  if (/(running|ready|idle|starting|updating|online|available)/.test(state)) return true;
+  if (/(running|ready|idle|online|available)/.test(state)) return true;
   return undefined;
 }
 
@@ -660,6 +788,7 @@ function summarizeInstance(instance: AmpInstance, status?: AmpRecord | null, inc
     port: pickNumber(status, "Port", "PortNumber", "ApplicationPort") ?? pickNumber(instanceRecord, "Port", "PortNumber") ?? null,
     running: isInstanceRunning(instance, status) ?? null,
     state: pickString(status, "State", "Status", "AppState", "ApplicationState") ?? null,
+    protected: isProtectedInstance(instance),
   };
 
   if (includeRaw) {
@@ -731,14 +860,18 @@ async function callManagedMethod(
   methodName: string,
   params: Record<string, unknown> = {},
 ) {
-  const policyBody = await assertPolicyAllows(moduleName, methodName, params);
+  const policyBody = await assertPolicyAllows(moduleName, methodName, params, instance);
   const result = await ampRequest(moduleName, methodName, policyBody, instance);
   assertAmpAccepted(`${moduleName}/${methodName}`, result);
   return result;
 }
 
-async function waitForInstanceState(instance: AmpInstance, desiredRunning: boolean, timeoutMs = defaultWaitTimeoutMs) {
-  const deadline = Date.now() + timeoutMs;
+async function waitForInstanceState(
+  instance: AmpInstance,
+  desiredRunning: boolean,
+  timeoutMs = defaultWaitTimeoutMs,
+  deadline = Date.now() + timeoutMs,
+) {
   let latest = summarizeInstance(instance);
 
   while (Date.now() <= deadline) {
@@ -759,22 +892,35 @@ async function statusForInstance(instance: AmpInstance) {
   return summarizeInstance(instance, findStatusForInstance(statuses, instance));
 }
 
-async function startPolicyInstance(instance: AmpInstance, wait = true, timeoutMs = defaultWaitTimeoutMs) {
-  const before = await statusForInstance(instance);
-  if (before.running === true) return { alreadyRunning: true, status: before };
+async function startPolicyInstance(
+  instance: AmpInstance,
+  wait = true,
+  timeoutMs = defaultWaitTimeoutMs,
+  deadline?: number,
+  force = false,
+) {
+  if (!force) {
+    const before = await statusForInstance(instance);
+    if (before.running === true) return { alreadyRunning: true, status: before };
+  }
 
   const result = await callAdsMethod("StartInstance", { InstanceName: instanceNameOrThrow(instance) });
   if (!wait) return { alreadyRunning: false, result, status: await statusForInstance(instance) };
-  return { alreadyRunning: false, result, status: await waitForInstanceState(instance, true, timeoutMs) };
+  return { alreadyRunning: false, result, status: await waitForInstanceState(instance, true, timeoutMs, deadline) };
 }
 
-async function stopPolicyInstance(instance: AmpInstance, wait = true, timeoutMs = defaultWaitTimeoutMs) {
+async function stopPolicyInstance(
+  instance: AmpInstance,
+  wait = true,
+  timeoutMs = defaultWaitTimeoutMs,
+  deadline?: number,
+) {
   const before = await statusForInstance(instance);
   if (before.running === false) return { alreadyStopped: true, status: before };
 
   const result = await callAdsMethod("StopInstance", { InstanceName: instanceNameOrThrow(instance) });
   if (!wait) return { alreadyStopped: false, result, status: await statusForInstance(instance) };
-  return { alreadyStopped: false, result, status: await waitForInstanceState(instance, false, timeoutMs) };
+  return { alreadyStopped: false, result, status: await waitForInstanceState(instance, false, timeoutMs, deadline) };
 }
 
 function shouldRetryManageAfterStart(error: unknown) {
@@ -797,17 +943,17 @@ async function ensureManagedInstance(
 
   try {
     const result = await callAdsMethod("ManageInstance", { InstanceId: instanceIdOf(instance) });
-    managedInstance ??= instance;
-    await ensureManagedSession(managedInstance, waitTimeoutMs);
-    return { instance: managedInstance, started, manageResult: result, status: await statusForInstance(managedInstance) };
+    managedInstance = instance;
+    await ensureManagedSession(instance, waitTimeoutMs);
+    return { instance, started, manageResult: result, status: await statusForInstance(instance) };
   } catch (error) {
     if (!options.startIfStopped || !shouldRetryManageAfterStart(error)) throw error;
     await startPolicyInstance(instance, true, waitTimeoutMs);
     started = true;
     const result = await callAdsMethod("ManageInstance", { InstanceId: instanceIdOf(instance) });
-    managedInstance ??= instance;
-    await ensureManagedSession(managedInstance, waitTimeoutMs);
-    return { instance: managedInstance, started, manageResult: result, status: await statusForInstance(managedInstance) };
+    managedInstance = instance;
+    await ensureManagedSession(instance, waitTimeoutMs);
+    return { instance, started, manageResult: result, status: await statusForInstance(instance) };
   }
 }
 
@@ -821,7 +967,27 @@ async function managedInstanceFor(query?: string, startIfStopped = true, waitTim
 // least some modules, which silently broke both root directory listings and the size
 // lookup used when reading root-level files such as server.properties.
 function normalizeAmpPath(value: string | undefined, fallback = "") {
-  return (value?.trim() || fallback).replace(/\\/g, "/").replace(/^\/+/, "");
+  const parts = (value?.trim() || fallback)
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter((part) => part && part !== ".");
+  if (parts.includes("..")) throw new Error("AMP file-manager paths cannot contain '..'.");
+  return parts.join("/");
+}
+
+function requiredAmpPath(value: string, label = "path") {
+  const normalized = normalizeAmpPath(value);
+  if (!normalized) throw new Error(`${label} must identify a file or directory, not the instance root.`);
+  return normalized;
+}
+
+function contentBuffer(content: string, encoding: "utf8" | "base64") {
+  if (encoding === "utf8") return Buffer.from(content, "utf8");
+  const compact = content.replace(/\s/g, "");
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(compact)) {
+    throw new Error("content is not valid base64.");
+  }
+  return Buffer.from(compact, "base64");
 }
 
 function splitAmpPath(filePath: string) {
@@ -870,7 +1036,7 @@ function chunkToBuffer(result: unknown) {
 }
 
 async function readFileContent(instance: AmpInstance, filePath: string, maxBytes = defaultMaxReadBytes, chunkSize = defaultFileChunkBytes) {
-  const filename = normalizeAmpPath(filePath);
+  const filename = requiredAmpPath(filePath);
   const size = await findFileSize(instance, filename);
   const chunks: Buffer[] = [];
   let offset = 0;
@@ -897,58 +1063,8 @@ async function readFileContent(instance: AmpInstance, filePath: string, maxBytes
   return { filename, bytesRead: offset, sizeBytes: size ?? null, truncated, buffer: Buffer.concat(chunks) };
 }
 
-function ampDirname(filePath: string) {
-  const normalized = normalizeAmpPath(filePath);
-  const slash = normalized.lastIndexOf("/");
-  return slash <= 0 ? "" : normalized.slice(0, slash);
-}
-
-function ampBasename(filePath: string) {
-  const normalized = normalizeAmpPath(filePath);
-  const slash = normalized.lastIndexOf("/");
-  return slash < 0 ? normalized : normalized.slice(slash + 1);
-}
-
-async function directoryExists(instance: AmpInstance, dir: string) {
-  try {
-    await listDirectory(instance, dir);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function resolveWritablePath(instance: AmpInstance, filePath: string) {
-  const normalized = normalizeAmpPath(filePath);
-  const dir = ampDirname(normalized);
-  if (await directoryExists(instance, dir)) return normalized;
-
-  const candidates = new Set<string>();
-  const basename = ampBasename(normalized);
-  const withoutServerIdentity = normalized.replace(/^server\/my_server_identity\//i, "");
-  const withoutRustPrefix = normalized.replace(/^rust\/258550\//i, "258550/");
-  candidates.add(withoutServerIdentity);
-  candidates.add(withoutRustPrefix);
-
-  if (!/^258550\//i.test(normalized)) {
-    candidates.add(`258550/${withoutServerIdentity}`);
-    candidates.add(`258550/${normalized}`);
-  }
-  if (/oxide\/plugins\/[^/]+$/i.test(normalized)) {
-    candidates.add(`258550/oxide/plugins/${basename}`);
-  }
-
-  for (const candidate of candidates) {
-    const normalizedCandidate = normalizeAmpPath(candidate);
-    if (normalizedCandidate === normalized) continue;
-    if (await directoryExists(instance, ampDirname(normalizedCandidate))) return normalizedCandidate;
-  }
-
-  return normalized;
-}
-
 async function writeBufferContent(instance: AmpInstance, filename: string, buffer: Buffer, chunkSize = defaultFileChunkBytes) {
-  const normalizedFilename = normalizeAmpPath(filename);
+  const normalizedFilename = requiredAmpPath(filename);
 
   if (buffer.length === 0) {
     const result = await callManagedMethod(instance, "FileManagerPlugin", "WriteFileChunk", {
@@ -977,32 +1093,9 @@ async function writeBufferContent(instance: AmpInstance, filename: string, buffe
   return { filename: normalizedFilename, bytesWritten: buffer.length, result: lastResult };
 }
 
-async function uploadViaTemporaryFile(instance: AmpInstance, filePath: string, content: string, encoding: "utf8" | "base64", chunkSize = defaultFileChunkBytes) {
-  const filename = await resolveWritablePath(instance, filePath);
-  const buffer = encoding === "base64" ? Buffer.from(content, "base64") : Buffer.from(content, "utf8");
-  const tempDir = mkdtempSync(path.join(os.tmpdir(), "amp-mcp-upload-"));
-  const tempPath = path.join(tempDir, ampBasename(filename) || "upload.bin");
-
-  try {
-    writeFileSync(tempPath, buffer);
-    const staged = readFileSync(tempPath);
-    return await writeBufferContent(instance, filename, staged, chunkSize);
-  } finally {
-    try {
-      unlinkSync(tempPath);
-    } catch {
-      // Temp cleanup is best-effort; the parent directory cleanup below catches the common case.
-    }
-    try {
-      rmSync(tempDir, { recursive: true, force: true });
-    } catch {
-      // Ignore cleanup failures so the original AMP error is preserved.
-    }
-  }
-}
-
-async function writeFileContent(instance: AmpInstance, filePath: string, content: string, encoding: "utf8" | "base64", chunkSize = defaultFileChunkBytes) {
-  return uploadViaTemporaryFile(instance, filePath, content, encoding, chunkSize);
+async function writeFileContent(instance: AmpInstance, filePath: string, buffer: Buffer, chunkSize = defaultFileChunkBytes) {
+  const filename = requiredAmpPath(filePath);
+  return writeBufferContent(instance, filename, buffer, chunkSize);
 }
 
 // AMP offers no working append primitive, verified against 2.7.2:
@@ -1012,9 +1105,8 @@ async function writeFileContent(instance: AmpInstance, filePath: string, content
 //     everything before it rather than preserving the existing bytes.
 // So read the current contents and rewrite the file with the new data concatenated,
 // refusing rather than truncating when the file is too large to read back in full.
-async function appendFileContent(instance: AmpInstance, filePath: string, content: string, encoding: "utf8" | "base64") {
-  const filename = normalizeAmpPath(filePath);
-  const buffer = encoding === "base64" ? Buffer.from(content, "base64") : Buffer.from(content, "utf8");
+async function appendFileContent(instance: AmpInstance, filePath: string, buffer: Buffer) {
+  const filename = requiredAmpPath(filePath);
   if (buffer.length === 0) return { filename, bytesAppended: 0, previousBytes: null, totalBytes: null, result: null };
 
   // A file absent from its directory listing is a create, not an append.
@@ -1070,21 +1162,39 @@ function findGuid(value: unknown): string | null {
   }
   const record = asRecord(value);
   if (!record) return null;
-  for (const key of ["Id", "ID", "TargetID", "TargetId", "InstanceID", "InstanceId"]) {
+  for (const key of ["Id", "ID", "TaskId", "TaskID", "TargetID", "TargetId", "InstanceID", "InstanceId", "Result"]) {
     const guid = findGuid(record[key]);
     if (guid) return guid;
   }
   return null;
 }
 
+async function waitForControllerTask(result: unknown, timeoutMs = defaultWaitTimeoutMs) {
+  const taskId = findGuid(result);
+  if (!taskId) return null;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    const task = asArray(await ampRequest("Core", "GetTasks"))
+      .map(asRecord)
+      .find((candidate) => candidate && pickString(candidate, "Id", "ID")?.toLowerCase() === taskId.toLowerCase());
+    if (task && (task.EndTime || task.Status === false || [2, 3, 4].includes(Number(task.State)))) {
+      assertAmpAccepted(`task ${taskId}`, task);
+      return task;
+    }
+    await sleep(defaultPollMs);
+  }
+  throw new Error(`Timed out waiting for AMP task ${taskId} after ${timeoutMs}ms.`);
+}
+
 async function resolveTargetAdsInstance(targetADSInstance?: string) {
   if (targetADSInstance) return targetADSInstance;
   const targetInfo = await ampRequest("ADSModule", "GetTargetInfo");
-  const targetId = findGuid(targetInfo);
+  const targetId = findGuid(targetInfo) ?? findGuid(await ampRequest("Core", "GetModuleInfo"));
   if (targetId) return targetId;
   throw new Error("Could not auto-detect TargetADSInstance. Pass targetADSInstance explicitly.");
 }
 
+function registerTools(server: McpServer) {
 server.registerTool(
   "amp_configure",
   {
@@ -1098,11 +1208,24 @@ server.registerTool(
     }),
   },
   async (args) => {
-    if (args.baseUrl) baseUrl = normalizeBaseUrl(args.baseUrl);
+    const nextBaseUrl = args.baseUrl ? normalizeBaseUrl(args.baseUrl) : baseUrl;
+    if (policyLocked && nextBaseUrl !== baseUrl) {
+      throw new Error("AMP base URL is locked by the process environment; restart with AMP_POLICY_LOCKED=false to change it at runtime.");
+    }
+    if (policyLocked && args.policyEnabled !== undefined && args.policyEnabled !== policyEnabled) {
+      throw new Error("AMP policy is locked by the process environment; restart with AMP_POLICY_LOCKED=false to change it at runtime.");
+    }
+    if (policyLocked && args.policyGroup !== undefined && args.policyGroup !== policyGroup) {
+      throw new Error("AMP policy group is locked by the process environment; restart with AMP_POLICY_LOCKED=false to change it at runtime.");
+    }
+    if (nextBaseUrl !== baseUrl || (args.sessionId !== undefined && args.sessionId !== sessionId)) {
+      resetConnectionState();
+    }
+    baseUrl = nextBaseUrl;
     if (args.sessionId !== undefined) sessionId = args.sessionId;
     if (args.policyEnabled !== undefined) policyEnabled = args.policyEnabled;
     if (args.policyGroup) policyGroup = args.policyGroup;
-    return textResult({ baseUrl, hasSession: sessionId.length > 0, policyEnabled, policyGroup });
+    return textResult({ baseUrl, hasSession: sessionId.length > 0, policyEnabled, policyGroup, policyLocked });
   },
 );
 
@@ -1126,12 +1249,12 @@ server.registerTool(
         throw new Error("No instance is selected. Call amp_use_instance first to inspect an instance's own API spec.");
       }
       if (refresh) {
-        managedSpec = null;
-        managedSpecInstanceId = "";
+        managedSpecs.delete(instanceIdOf(managedInstance));
       }
-      const instanceSpec = (await getManagedSpec()) ?? {};
+      const selected = managedInstance;
+      const instanceSpec = (await getManagedSpec(selected)) ?? {};
       return textResult({
-        instance: summarizeInstance(managedInstance),
+        instance: summarizeInstance(selected),
         moduleName: moduleName ?? null,
         module: moduleName ? (instanceSpec[moduleName] ?? null) : undefined,
         availableModules: Object.keys(instanceSpec),
@@ -1139,7 +1262,8 @@ server.registerTool(
       });
     }
     if (refresh) {
-      cachedSpec = (await ampRequest("Core", "GetAPISpec")) as AmpSpec;
+        await ensureSession("Core", "GetAPISpec");
+        cachedSpec = await refreshControllerSpec();
     }
     if (moduleName) {
       return textResult({
@@ -1210,7 +1334,7 @@ server.registerTool(
     }),
   },
   async ({ username, password, token, rememberMe }) => {
-    const result = await ampRequest("Core", "Login", {
+    const result = await loginAndRefresh({
       username,
       password,
       token: token ?? "",
@@ -1235,7 +1359,7 @@ server.registerTool(
       throw new Error("Set AMP_USERNAME and AMP_PASSWORD in the MCP environment or .env before using amp_login_from_env.");
     }
 
-    const result = await ampRequest("Core", "Login", {
+    const result = await loginAndRefresh({
       username,
       password,
       token: process.env.AMP_TOKEN ?? "",
@@ -1253,9 +1377,7 @@ server.registerTool(
     inputSchema: z.object({}),
   },
   async () => {
-    sessionId = "";
-    managedInstance = null;
-    managedSessionId = "";
+    resetConnectionState();
     return textResult({ baseUrl, hasSession: false });
   },
 );
@@ -1276,9 +1398,11 @@ server.registerTool(
       hasPassword: Boolean(process.env.AMP_PASSWORD),
       hasToken: Boolean(process.env.AMP_TOKEN),
       hasControllerSession: Boolean(sessionId),
-      hasManagedSession: Boolean(managedSessionId),
+      hasManagedSession: Boolean(managedInstance && managedSessions.has(instanceIdOf(managedInstance))),
       policyEnabled,
       policyGroup,
+      policyLocked,
+      protectedInstanceSelectorsConfigured: protectedInstanceSelectors.size,
       selected: instanceLabel(managedInstance),
     };
 
@@ -1340,7 +1464,7 @@ server.registerTool(
       selected: summarizeInstance(ready.instance, null),
       started: ready.started,
       managed: Boolean(managedInstance),
-      hasManagedSession: Boolean(managedSessionId),
+      hasManagedSession: managedSessions.has(instanceIdOf(ready.instance)),
       status: ready.status,
     });
   },
@@ -1378,9 +1502,9 @@ server.registerTool(
   async ({ instance, wait, waitTimeoutMs }) => {
     const selected = await resolvePolicyInstance(instance, true);
     const result = await stopPolicyInstance(selected, wait ?? true, waitTimeoutMs);
+    managedSessions.delete(instanceIdOf(selected));
     if (managedInstance && sameInstance(selected, managedInstance)) {
       managedInstance = null;
-      managedSessionId = "";
     }
     return textResult({ instance: summarizeInstance(selected), ...result });
   },
@@ -1407,10 +1531,45 @@ server.registerTool(
       return textResult({ instance: summarizeInstance(selected), restarted: false, startedBecauseStopped: true, ...started });
     }
 
+    if (wait ?? true) {
+      const timeoutMs = waitTimeoutMs ?? defaultWaitTimeoutMs;
+      const deadline = Date.now() + timeoutMs;
+      let stopped: Awaited<ReturnType<typeof stopPolicyInstance>>;
+      try {
+        stopped = await stopPolicyInstance(selected, true, timeoutMs, deadline);
+      } catch (error) {
+        let recovery: Awaited<ReturnType<typeof startPolicyInstance>>;
+        try {
+          recovery = await startPolicyInstance(selected, false, defaultWaitTimeoutMs, undefined, true);
+        } catch (recoveryError) {
+          throw new Error(
+            `Restart timed out during stop and the direct start recovery call was not accepted: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}. Original cause: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        throw new Error(
+          `Restart did not observe a completed stop before the timeout; a direct start was requested. Recovery: ${JSON.stringify(recovery)}. Cause: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      managedSessions.delete(instanceIdOf(selected));
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        let recovery: Awaited<ReturnType<typeof startPolicyInstance>>;
+        try {
+          recovery = await startPolicyInstance(selected, false, defaultWaitTimeoutMs, undefined, true);
+        } catch (recoveryError) {
+          throw new Error(
+            `Restart timed out after stopping and the direct start recovery call was not accepted: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}.`,
+          );
+        }
+        throw new Error(`Restart timed out after stopping; a direct start was requested. Recovery: ${JSON.stringify(recovery)}.`);
+      }
+      const started = await startPolicyInstance(selected, true, remainingMs, deadline);
+      return textResult({ instance: summarizeInstance(selected), restarted: true, stopped, started, status: started.status });
+    }
+
     result = await callAdsMethod("RestartInstance", { InstanceName: instanceNameOrThrow(selected) });
-    if (managedInstance && sameInstance(selected, managedInstance)) managedSessionId = "";
-    const status = wait ?? true ? await waitForInstanceState(selected, true, waitTimeoutMs) : await statusForInstance(selected);
-    return textResult({ instance: summarizeInstance(selected), restarted: true, result, status });
+    managedSessions.delete(instanceIdOf(selected));
+    return textResult({ instance: summarizeInstance(selected), restarted: true, result, status: await statusForInstance(selected) });
   },
 );
 
@@ -1427,8 +1586,9 @@ server.registerTool(
     }),
   },
   async ({ path: dir, instance, startIfStopped, waitTimeoutMs }) => {
+    const normalizedPath = normalizeAmpPath(dir);
     const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
-    const listing = await listDirectory(selected, dir ?? "");
+    const listing = await listDirectory(selected, normalizedPath);
     return textResult({ instance: summarizeInstance(selected), ...listing });
   },
 );
@@ -1449,8 +1609,9 @@ server.registerTool(
     }),
   },
   async ({ path: filePath, instance, encoding, maxBytes, chunkSize, startIfStopped, waitTimeoutMs }) => {
+    const normalizedPath = requiredAmpPath(filePath);
     const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
-    const file = await readFileContent(selected, filePath, maxBytes, chunkSize ?? defaultFileChunkBytes);
+    const file = await readFileContent(selected, normalizedPath, maxBytes, chunkSize ?? defaultFileChunkBytes);
     return textResult({
       instance: summarizeInstance(selected),
       path: file.filename,
@@ -1479,8 +1640,10 @@ server.registerTool(
     }),
   },
   async ({ path: filePath, content, instance, encoding, chunkSize, startIfStopped, waitTimeoutMs }) => {
+    const normalizedPath = requiredAmpPath(filePath);
+    const buffer = contentBuffer(content, encoding ?? "utf8");
     const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
-    const result = await writeFileContent(selected, filePath, content, encoding ?? "utf8", chunkSize ?? defaultFileChunkBytes);
+    const result = await writeFileContent(selected, normalizedPath, buffer, chunkSize ?? defaultFileChunkBytes);
     return textResult({ instance: summarizeInstance(selected), ...result });
   },
 );
@@ -1500,8 +1663,10 @@ server.registerTool(
     }),
   },
   async ({ path: filePath, content, instance, encoding, startIfStopped, waitTimeoutMs }) => {
+    const normalizedPath = requiredAmpPath(filePath);
+    const buffer = contentBuffer(content, encoding ?? "utf8");
     const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
-    const result = await appendFileContent(selected, filePath, content, encoding ?? "utf8");
+    const result = await appendFileContent(selected, normalizedPath, buffer);
     return textResult({ instance: summarizeInstance(selected), ...result });
   },
 );
@@ -1523,9 +1688,8 @@ server.registerTool(
     }),
   },
   async ({ path: filePath, newPath, instance, startIfStopped, waitTimeoutMs }) => {
-    const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
-    const from = normalizeAmpPath(filePath);
-    const target = splitAmpPath(normalizeAmpPath(newPath));
+    const from = requiredAmpPath(filePath);
+    const target = splitAmpPath(requiredAmpPath(newPath, "newPath"));
     const source = splitAmpPath(from);
 
     // AMP resolves NewFilename relative to the source file's own directory, so passing a
@@ -1537,6 +1701,7 @@ server.registerTool(
       );
     }
 
+    const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
     const result = await callManagedMethod(selected, "FileManagerPlugin", "RenameFile", {
       Filename: from,
       NewFilename: target.name,
@@ -1560,12 +1725,14 @@ server.registerTool(
     }),
   },
   async ({ path: filePath, targetDirectory, instance, startIfStopped, waitTimeoutMs }) => {
+    const source = requiredAmpPath(filePath);
+    const destination = normalizeAmpPath(targetDirectory);
     const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
     const result = await callManagedMethod(selected, "FileManagerPlugin", "CopyFile", {
-      Origin: normalizeAmpPath(filePath),
-      TargetDirectory: normalizeAmpPath(targetDirectory),
+      Origin: source,
+      TargetDirectory: destination,
     });
-    return textResult({ instance: summarizeInstance(selected), path: normalizeAmpPath(filePath), targetDirectory: normalizeAmpPath(targetDirectory), result });
+    return textResult({ instance: summarizeInstance(selected), path: source, targetDirectory: destination, result });
   },
 );
 
@@ -1582,8 +1749,8 @@ server.registerTool(
     }),
   },
   async ({ path: filePath, instance, startIfStopped, waitTimeoutMs }) => {
+    const normalizedPath = requiredAmpPath(filePath);
     const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
-    const normalizedPath = normalizeAmpPath(filePath);
     const result = await callManagedMethod(selected, "FileManagerPlugin", "TrashFile", { Filename: normalizedPath });
     return textResult({ instance: summarizeInstance(selected), path: normalizedPath, trashed: true, result });
   },
@@ -1602,8 +1769,8 @@ server.registerTool(
     }),
   },
   async ({ path: dirPath, instance, startIfStopped, waitTimeoutMs }) => {
+    const normalizedPath = requiredAmpPath(dirPath);
     const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
-    const normalizedPath = normalizeAmpPath(dirPath);
     const result = await callManagedMethod(selected, "FileManagerPlugin", "CreateDirectory", { NewPath: normalizedPath });
     return textResult({ instance: summarizeInstance(selected), path: normalizedPath, result });
   },
@@ -1623,12 +1790,15 @@ server.registerTool(
     }),
   },
   async ({ path: dirPath, newName, instance, startIfStopped, waitTimeoutMs }) => {
+    const normalizedPath = requiredAmpPath(dirPath);
+    const normalizedName = requiredAmpPath(newName, "newName");
+    if (normalizedName.includes("/")) throw new Error("newName must be a directory name, not a path.");
     const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
     const result = await callManagedMethod(selected, "FileManagerPlugin", "RenameDirectory", {
-      oldDirectory: normalizeAmpPath(dirPath),
-      NewDirectoryName: newName,
+      oldDirectory: normalizedPath,
+      NewDirectoryName: normalizedName,
     });
-    return textResult({ instance: summarizeInstance(selected), path: normalizeAmpPath(dirPath), newName, result });
+    return textResult({ instance: summarizeInstance(selected), path: normalizedPath, newName: normalizedName, result });
   },
 );
 
@@ -1645,8 +1815,8 @@ server.registerTool(
     }),
   },
   async ({ path: dirPath, instance, startIfStopped, waitTimeoutMs }) => {
+    const normalizedPath = requiredAmpPath(dirPath);
     const selected = await managedInstanceFor(instance, startIfStopped ?? true, waitTimeoutMs);
-    const normalizedPath = normalizeAmpPath(dirPath);
     const result = await callManagedMethod(selected, "FileManagerPlugin", "TrashDirectory", { DirectoryName: normalizedPath });
     return textResult({ instance: summarizeInstance(selected), path: normalizedPath, trashed: true, result });
   },
@@ -1691,7 +1861,7 @@ server.registerTool(
 server.registerTool(
   "amp_supported_apps",
   {
-    description: "List AMP-supported application modules that can be used when creating instances.",
+    description: "List AMP-supported applications and configuration IDs that can be used when creating instances.",
     annotations: { title: "List supported applications", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     inputSchema: z.object({
       full: z.boolean().optional().describe("Return full application records instead of summaries."),
@@ -1710,6 +1880,7 @@ server.registerTool(
     annotations: { title: "Create new instance", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     inputSchema: z.object({
       module: z.string().min(1).describe("AMP module name, for example Minecraft, Valheim, or any module reported by amp_supported_apps."),
+      applicationId: z.string().optional().describe("Application/configuration ID from amp_supported_apps. Its module and settings are loaded automatically."),
       friendlyName: z.string().min(1).describe("Human-friendly display name for the new instance."),
       instanceName: z.string().optional().describe("Internal instance name. Defaults to a safe name generated from friendlyName."),
       targetADSInstance: z.string().optional().describe("Target ADS instance GUID. Auto-detected when possible."),
@@ -1724,12 +1895,29 @@ server.registerTool(
       startOnBoot: z.boolean().optional(),
       displayImageSource: z.string().optional(),
       targetDatastore: z.number().int().optional(),
+      wait: z.boolean().optional().describe("Wait for AMP's create task to finish. Defaults to true."),
+      waitTimeoutMs: z.number().int().positive().optional(),
     }),
   },
   async (args) => {
     const autoConfigure = args.autoConfigure ?? true;
     if (!autoConfigure && args.portNumber === undefined) {
       throw new Error("portNumber is required when autoConfigure is false.");
+    }
+
+    let moduleName = args.module;
+    let provisionSettings = args.provisionSettings ?? {};
+    if (args.applicationId) {
+      const application = asArray(await ampRequest("ADSModule", "GetSupportedApplications"))
+        .map(asRecord)
+        .find((candidate) => pickString(candidate, "Id", "ID")?.toLowerCase() === args.applicationId?.toLowerCase());
+      if (!application) throw new Error(`Unknown AMP applicationId "${args.applicationId}".`);
+      moduleName = pickString(application, "ModuleName") ?? moduleName;
+      const settings = asRecord(application.Settings);
+      provisionSettings = {
+        ...Object.fromEntries(Object.entries(settings ?? {}).filter((entry): entry is [string, string] => typeof entry[1] === "string")),
+        ...provisionSettings,
+      };
     }
 
     const safeName =
@@ -1739,14 +1927,14 @@ server.registerTool(
     const body = cleanParams({
       TargetADSInstance: targetADSInstance,
       NewInstanceId: args.newInstanceId ?? randomUUID(),
-      Module: args.module,
+      Module: moduleName,
       InstanceName: safeName,
       FriendlyName: args.friendlyName,
       IPBinding: args.ipBinding ?? "0.0.0.0",
       PortNumber: args.portNumber ?? 0,
       AdminUsername: args.adminUsername ?? "admin",
       AdminPassword: args.adminPassword ?? randomUUID(),
-      ProvisionSettings: args.provisionSettings ?? {},
+      ProvisionSettings: provisionSettings,
       AutoConfigure: autoConfigure,
       PostCreate: normalizePostCreate(args.postCreate),
       StartOnBoot: args.startOnBoot ?? false,
@@ -1756,13 +1944,16 @@ server.registerTool(
     });
 
     const result = await callAdsMethod("CreateInstance", body);
+    const task = args.wait ?? true ? await waitForControllerTask(result, args.waitTimeoutMs) : null;
     return textResult({
       policyGroup,
       instanceName: safeName,
       friendlyName: args.friendlyName,
-      module: args.module,
+      module: moduleName,
+      applicationId: args.applicationId ?? null,
       targetADSInstance,
       result,
+      task,
       note: `The MCP policy forces this instance into display group "${policyGroup}".`,
     });
   },
@@ -1772,17 +1963,29 @@ server.registerTool(
   "amp_call",
   {
     description:
-      "Call any method from the AMP API spec. Non-ADSModule calls are routed to the selected instance, so after amp_use_instance this also reaches that instance's own application modules (MinecraftModule, GenericModule, ...). Use amp_api_spec with fromManagedInstance to discover them.",
+      "Call any method from the AMP API spec. Scope can explicitly target the controller or selected managed instance; auto routes non-ADS modules to the selected instance when present.",
     annotations: { title: "Call any AMP API method", readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     inputSchema: z.object({
       moduleName: z.string().min(1),
       methodName: z.string().min(1),
       params: z.record(z.string(), z.unknown()).optional(),
+      scope: z.enum(["auto", "controller", "managed"]).optional().describe("Defaults to auto."),
       confirm: z.boolean().optional().describe("Required for state-changing methods."),
     }),
   },
-  async ({ moduleName, methodName, params, confirm }) => {
-    const { meta, refreshed, refreshError } = await resolveMethodMeta(moduleName, methodName);
+  async ({ moduleName, methodName, params, scope, confirm }) => {
+    const requestedScope = scope ?? "auto";
+    if (requestedScope === "managed" && !managedInstance) {
+      throw new Error("No instance is selected. Call amp_use_instance before using managed scope.");
+    }
+    if (requestedScope === "managed" && moduleName === "ADSModule") {
+      throw new Error("ADSModule is controller-scoped; use controller or auto scope.");
+    }
+    const routeInstance =
+      requestedScope === "managed" || (requestedScope === "auto" && managedInstance && moduleName !== "ADSModule")
+        ? managedInstance
+        : null;
+    const { meta, refreshed, refreshError } = await resolveMethodMeta(moduleName, methodName, routeInstance);
     if (!meta) {
       if (moduleName.toLowerCase() === "amp_api_spec") {
         throw new Error("amp_api_spec is an MCP tool, not an AMP API module. Call the amp_api_spec tool directly.");
@@ -1796,14 +1999,20 @@ server.registerTool(
       throw new Error(`Refusing to call state-changing method ${moduleName}/${methodName} without confirm: true.`);
     }
     const body = normalizeParams(meta, params ?? {});
-    const policyBody = await assertPolicyAllows(moduleName, methodName, body);
-    const useManagedRoute = Boolean(managedInstance && moduleName !== "ADSModule");
-    const result = await ampRequest(moduleName, methodName, policyBody, useManagedRoute ? managedInstance : null);
+    const policyBody = await assertPolicyAllows(moduleName, methodName, body, routeInstance);
+    const result = await ampRequest(moduleName, methodName, policyBody, routeInstance);
     await updateManagedInstance(moduleName, methodName, policyBody, result);
     assertAmpAccepted(`${moduleName}/${methodName}`, result);
     return textResult(result);
   },
 );
+}
+
+function createServer() {
+  const server = new McpServer({ name: "amp-http-mcp-server", version: "1.0.0" });
+  registerTools(server);
+  return server;
+}
 
 // AMP returns an empty listing for a "." root instead of an error, so a regression here
 // is silent. Assert the root forms all collapse to "".
@@ -1812,7 +2021,8 @@ function checkPathHandling() {
     [undefined, ""],
     ["", ""],
     ["/", ""],
-    [".", "."],
+    [".", ""],
+    ["./cfg/server.cfg", "cfg/server.cfg"],
     ["  ", ""],
     ["/cfg/server.cfg", "cfg/server.cfg"],
     ["cfg\\server.cfg", "cfg/server.cfg"],
@@ -1822,6 +2032,24 @@ function checkPathHandling() {
     if (actual !== expected) {
       throw new Error(`normalizeAmpPath(${JSON.stringify(input)}) returned ${JSON.stringify(actual)}, expected ${JSON.stringify(expected)}`);
     }
+  }
+  try {
+    normalizeAmpPath("../outside.txt");
+    throw new Error("normalizeAmpPath accepted a parent-directory traversal.");
+  } catch (error) {
+    if (!(error instanceof Error) || !error.message.includes("cannot contain")) throw error;
+  }
+  if (!requiresConfirmation("Core", "GetRemoteLoginToken") || requiresConfirmation("Core", "GetStatus")) {
+    throw new Error("Sensitive Get* confirmation classification regressed.");
+  }
+  if (coerceValue({ Name: "value", TypeName: "Nullable<Guid>", Optional: false }, null) !== null) {
+    throw new Error("Nullable AMP parameter coercion regressed.");
+  }
+  try {
+    contentBuffer("%%%", "base64");
+    throw new Error("Malformed base64 was accepted.");
+  } catch (error) {
+    if (!(error instanceof Error) || !error.message.includes("valid base64")) throw error;
   }
   const root = splitAmpPath("server.properties");
   if (root.dir !== "" || root.name !== "server.properties") {
@@ -1833,8 +2061,21 @@ function checkPathHandling() {
   }
 }
 
+async function checkPolicyGuards() {
+  if (!policyEnabled) return;
+  for (const [moduleName, methodName] of [["ADSModule", "StopAllInstances"], ["Core", "DeleteUser"]]) {
+    try {
+      await assertPolicyAllows(moduleName, methodName, {}, null);
+      throw new Error(`Policy accepted unscoped mutation ${moduleName}/${methodName}.`);
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.startsWith("Policy blocked")) throw error;
+    }
+  }
+}
+
 async function selfTest() {
   checkPathHandling();
+  await checkPolicyGuards();
   const modules = Object.keys(cachedSpec);
   const methods = modules.reduce((sum, moduleName) => sum + Object.keys(cachedSpec[moduleName] ?? {}).length, 0);
   const result: Record<string, unknown> = {
@@ -1852,7 +2093,7 @@ async function selfTest() {
     if (!process.env.AMP_USERNAME || !process.env.AMP_PASSWORD) {
       throw new Error("Set AMP_USERNAME and AMP_PASSWORD in the MCP environment or .env to run --self-test-login.");
     }
-    const loginResult = await ampRequest("Core", "Login", {
+    const loginResult = await loginAndRefresh({
       username: process.env.AMP_USERNAME,
       password: process.env.AMP_PASSWORD,
       token: process.env.AMP_TOKEN ?? "",
@@ -1870,7 +2111,7 @@ async function main() {
     await selfTest();
     return;
   }
-  const handle = serveStdio(() => server);
+  const handle = serveStdio(createServer);
   console.error(`amp-http-mcp-server connected for ${baseUrl}`);
   const shutdown = async () => {
     await handle.close();

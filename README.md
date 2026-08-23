@@ -56,6 +56,8 @@ AMP_REMEMBER_ME=false
 # MCP-side safety policy.
 AMP_POLICY_ENABLED=true
 AMP_POLICY_GROUP=AI
+AMP_POLICY_LOCKED=true
+AMP_PROTECTED_INSTANCES=
 ```
 
 Then test login without printing credentials:
@@ -80,7 +82,9 @@ If you run this from Codex, you can put the same values under `[mcp_servers.amp.
         "AMP_USERNAME": "amp-automation-user",
         "AMP_PASSWORD": "change-me",
         "AMP_POLICY_ENABLED": "true",
-        "AMP_POLICY_GROUP": "AI"
+        "AMP_POLICY_GROUP": "AI",
+        "AMP_POLICY_LOCKED": "true",
+        "AMP_PROTECTED_INSTANCES": "instance-id-or-name,another-instance-id-or-name"
       }
     }
   }
@@ -234,6 +238,10 @@ To create a new instance, first inspect modules with `amp_supported_apps`, then 
 }
 ```
 
+For a GenericModule application, pass its `Id` from `amp_supported_apps` as `applicationId`;
+the tool loads the catalogued module settings automatically instead of requiring a large
+`provisionSettings` object.
+
 The MCP policy forces created instances into `AMP_POLICY_GROUP`.
 
 ## Safety Model
@@ -257,8 +265,11 @@ returned by `Core/Login` as authoritative rather than the role names shown in th
 
 When the MCP policy is enabled:
 
-- ADS create calls are forced into `Group` / `DisplayGroup` matching `AMP_POLICY_GROUP`.
+- Supported ADS create calls are forced into `Group` matching `AMP_POLICY_GROUP`.
 - Existing-instance ADS calls are blocked unless the target instance is currently in that display group.
+- Policy and base-URL changes are locked at runtime unless `AMP_POLICY_LOCKED=false` is set before launch.
+- Controller-wide and aggregate state-changing raw calls are blocked because they cannot be scoped to one display group.
+- State-changing calls against IDs/names in `AMP_PROTECTED_INSTANCES` are blocked; read-only calls remain available.
 - After `ADSModule/ManageInstance`, instance module calls such as `FileManagerPlugin/*` are routed through AMP's controller proxy path: `/API/ADSModule/Servers/{instanceId}/API/{Module}/{Method}`.
 - File-manager calls are blocked unless the managed AMP instance is in the policy group.
 - Friendly tools resolve instance names only from the policy group. If a name matches multiple instances, the tool refuses to guess.
@@ -290,6 +301,11 @@ The bundled `src/amp-api-spec.json` is only a fallback. After login, call:
 
 with `amp_api_spec` to load the live methods exposed by your AMP server, modules, and extensions.
 
+The server also refreshes the authenticated controller catalog immediately after login and refuses
+to replace it with AMP's much smaller anonymous discovery catalog. On the audited deployment,
+the live AMP 2.8.0.4 catalog exactly matches the fallback: 7 modules and 205 methods. AMP's actual
+interactive API browser is `/api`; `/apiNote` is the normal panel shell, not API documentation.
+
 The controller spec does not list an application instance's own modules. After selecting an
 instance with `amp_use_instance`, pass:
 
@@ -302,3 +318,6 @@ instance with `amp_use_instance`, pass:
 to read that instance's own spec (`MinecraftModule`, `GenericModule`, and so on). `amp_call`
 resolves against the selected instance's spec automatically, so those application methods are
 callable once an instance is selected.
+
+Use `scope: "controller"` or `scope: "managed"` with `amp_call` when a module such as `Core`
+exists at both levels. The default `scope: "auto"` keeps the convenient selected-instance routing.
