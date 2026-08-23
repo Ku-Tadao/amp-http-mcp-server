@@ -321,3 +321,18 @@ callable once an instance is selected.
 
 Use `scope: "controller"` or `scope: "managed"` with `amp_call` when a module such as `Core`
 exists at both levels. The default `scope: "auto"` keeps the convenient selected-instance routing.
+
+## Authentication retry safety
+
+Rejected controller and managed-instance logins use an exponential cooldown: 60 seconds after
+the first rejection, doubling up to 15 minutes. Configure the bounds with
+`AMP_AUTH_RETRY_BASE_MS` and `AMP_AUTH_RETRY_MAX_MS`. Network failures are retried normally;
+only authentication rejections and HTTP 401/403/429 responses advance the cooldown. A successful
+login resets it. After correcting credentials, `amp_clear_session` also resets the cooldown.
+
+## Transport scope
+
+This executable is stdio-only and keeps AMP connection/session state for the life of its single
+process. The fresh `McpServer` factory exists for stdio protocol-version fallback; it does not make
+AMP state safe for multiple HTTP clients. Any future Streamable HTTP entry point must create AMP
+state per MCP session and clean it up when that session closes.

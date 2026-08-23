@@ -38,6 +38,11 @@ type AmpInstance = {
   [key: string]: unknown;
 };
 type AmpRecord = Record<string, unknown>;
+type AuthRetryState = { failures: number; retryAt: number };
+
+class AmpAuthenticationRejectedError extends Error {
+  override name = "AmpAuthenticationRejectedError";
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
@@ -64,6 +69,8 @@ let managedInstance: AmpInstance | null = null;
 const managedSessions = new Map<string, string>();
 let controllerLoginPromise: Promise<void> | null = null;
 const managedLoginPromises = new Map<string, Promise<void>>();
+const controllerAuthRetry: AuthRetryState = { failures: 0, retryAt: 0 };
+const managedAuthRetries = new Map<string, AuthRetryState>();
 
 function positiveEnvNumber(name: string, fallback: number, integer = false, max = Number.POSITIVE_INFINITY) {
   const value = Number(process.env[name] ?? fallback);
@@ -79,6 +86,11 @@ const defaultManagedLoginTimeoutMs = positiveEnvNumber("AMP_MANAGED_LOGIN_TIMEOU
 const defaultFileChunkBytes = positiveEnvNumber("AMP_FILE_CHUNK_BYTES", 524288, true);
 const defaultMaxReadBytes = positiveEnvNumber("AMP_MAX_READ_BYTES", 1048576, true);
 const defaultHttpTimeoutMs = positiveEnvNumber("AMP_HTTP_TIMEOUT_MS", 30000, true, 4294967295);
+const authRetryBaseMs = positiveEnvNumber("AMP_AUTH_RETRY_BASE_MS", 60000, true, 4294967295);
+const authRetryMaxMs = positiveEnvNumber("AMP_AUTH_RETRY_MAX_MS", 900000, true, 4294967295);
+if (authRetryMaxMs < authRetryBaseMs) {
+  throw new Error("AMP_AUTH_RETRY_MAX_MS must be greater than or equal to AMP_AUTH_RETRY_BASE_MS.");
+}
 
 function loadEnvFile(filePath: string) {
   if (!existsSync(filePath)) return;
@@ -147,6 +159,29 @@ function redactErrorText(value: string) {
   return output.slice(0, 2000);
 }
 
+function assertAuthRetryAllowed(label: string, state: AuthRetryState) {
+  const remainingMs = state.retryAt - Date.now();
+  if (remainingMs > 0) {
+    throw new Error(
+      `${label} login is cooling down after ${state.failures} consecutive authentication rejection${state.failures === 1 ? "" : "s"}. Retry in ${Math.ceil(remainingMs / 1000)} seconds, or correct the credentials and call amp_clear_session to reset the cooldown.`,
+    );
+  }
+}
+
+function recordAuthRejection(state: AuthRetryState) {
+  state.failures += 1;
+  state.retryAt = Date.now() + Math.min(authRetryMaxMs, authRetryBaseMs * 2 ** Math.min(state.failures - 1, 20));
+}
+
+function clearAuthRetry(state: AuthRetryState) {
+  state.failures = 0;
+  state.retryAt = 0;
+}
+
+function isAuthenticationRejection(error: unknown) {
+  return error instanceof AmpAuthenticationRejectedError || (error instanceof Error && /AMP HTTP (401|403|429)\b/.test(error.message));
+}
+
 function findMethodMeta(moduleName: string, methodName: string) {
   return cachedSpec[moduleName]?.[methodName] ?? null;
 }
@@ -160,9 +195,11 @@ function resetConnectionState(clearControllerSession = true) {
   if (clearControllerSession) sessionId = "";
   cachedSpec = fallbackSpec as AmpSpec;
   controllerLoginPromise = null;
+  clearAuthRetry(controllerAuthRetry);
   managedInstance = null;
   managedSessions.clear();
   managedLoginPromises.clear();
+  managedAuthRetries.clear();
   managedSpecs.clear();
   loginCredentials = {
     username: process.env.AMP_USERNAME ?? "",
@@ -287,6 +324,18 @@ function shouldSkipEnvLogin(moduleName: string, methodName: string) {
   );
 }
 
+async function loginControllerWithBackoff(params: { username: string; password: string; token: string; rememberMe: boolean }) {
+  assertAuthRetryAllowed("Controller", controllerAuthRetry);
+  try {
+    const result = await loginAndRefresh(params);
+    clearAuthRetry(controllerAuthRetry);
+    return result;
+  } catch (error) {
+    if (isAuthenticationRejection(error)) recordAuthRejection(controllerAuthRetry);
+    throw error;
+  }
+}
+
 async function ensureSession(moduleName: string, methodName: string) {
   if (shouldSkipEnvLogin(moduleName, methodName)) return;
   if (controllerLoginPromise) return controllerLoginPromise;
@@ -294,7 +343,7 @@ async function ensureSession(moduleName: string, methodName: string) {
   const { username, password, token } = loginCredentials;
   if (!username || !password) return;
 
-  controllerLoginPromise = loginAndRefresh({ username, password, token, rememberMe: process.env.AMP_REMEMBER_ME === "true" }).then(
+  controllerLoginPromise = loginControllerWithBackoff({ username, password, token, rememberMe: process.env.AMP_REMEMBER_ME === "true" }).then(
     () => undefined,
   );
   try {
@@ -314,6 +363,9 @@ async function ensureManagedSession(instance: AmpInstance, timeoutMs = defaultMa
   if (managedSessions.has(id)) return;
   const inFlight = managedLoginPromises.get(id);
   if (inFlight) return inFlight;
+  const authRetry = managedAuthRetries.get(id) ?? { failures: 0, retryAt: 0 };
+  managedAuthRetries.set(id, authRetry);
+  assertAuthRetryAllowed(`Managed instance "${instanceLabel(instance)}"`, authRetry);
 
   const login = (async () => {
     const { username, password, token } = loginCredentials;
@@ -327,9 +379,22 @@ async function ensureManagedSession(instance: AmpInstance, timeoutMs = defaultMa
     while (Date.now() <= deadline) {
       try {
         const result = await ampRequest("Core", "Login", { username, password, token, rememberMe: false }, instance);
-        if (!isAmpError(result) && !isActionFailure(result) && managedSessions.has(id)) return;
-        lastError = getAmpErrorMessage(result) || actionMessage(result) || JSON.stringify(redact(result));
+        if (isAmpError(result) || isActionFailure(result)) {
+          managedSessions.delete(id);
+          throw new AmpAuthenticationRejectedError(
+            `AMP rejected managed Core/Login: ${getAmpErrorMessage(result) || actionMessage(result) || "authentication failed"}`,
+          );
+        }
+        if (managedSessions.has(id)) {
+          managedAuthRetries.delete(id);
+          return;
+        }
+        throw new AmpAuthenticationRejectedError("AMP accepted managed Core/Login but returned no session ID.");
       } catch (error) {
+        if (isAuthenticationRejection(error)) {
+          recordAuthRejection(authRetry);
+          throw error;
+        }
         lastError = error instanceof Error ? error.message : String(error);
       }
       await sleep(defaultPollMs);
@@ -453,9 +518,23 @@ async function refreshControllerSpec() {
 }
 
 async function loginAndRefresh(params: { username: string; password: string; token: string; rememberMe: boolean }) {
-  const result = await ampRequest("Core", "Login", params);
-  assertAmpAccepted("Core/Login", result);
-  if (!sessionId) throw new Error("AMP accepted the login request but returned no session ID.");
+  let result: unknown;
+  try {
+    result = await ampRequest("Core", "Login", params);
+  } catch (error) {
+    if (isAuthenticationRejection(error)) {
+      sessionId = "";
+      throw new AmpAuthenticationRejectedError(error instanceof Error ? error.message : String(error));
+    }
+    throw error;
+  }
+  if (isAmpError(result) || isActionFailure(result)) {
+    sessionId = "";
+    throw new AmpAuthenticationRejectedError(
+      `AMP rejected Core/Login: ${getAmpErrorMessage(result) || actionMessage(result) || "authentication failed"}`,
+    );
+  }
+  if (!sessionId) throw new AmpAuthenticationRejectedError("AMP accepted Core/Login but returned no session ID.");
   loginCredentials = { username: params.username, password: params.password, token: params.token };
   cachedSpec = await refreshControllerSpec();
   return result;
@@ -1156,10 +1235,16 @@ function cleanParams(params: Record<string, unknown>) {
   return Object.fromEntries(Object.entries(params).filter(([, value]) => value !== undefined));
 }
 
-function findGuid(value: unknown): string | null {
+function directGuid(value: unknown): string | null {
   if (typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)) {
     return value;
   }
+  return null;
+}
+
+function findGuid(value: unknown): string | null {
+  const direct = directGuid(value);
+  if (direct) return direct;
   const record = asRecord(value);
   if (!record) return null;
   for (const key of ["Id", "ID", "TaskId", "TaskID", "TargetID", "TargetId", "InstanceID", "InstanceId", "Result"]) {
@@ -1169,15 +1254,38 @@ function findGuid(value: unknown): string | null {
   return null;
 }
 
+function taskIdFromResult(value: unknown): string | null {
+  const direct = directGuid(value);
+  if (direct) return direct;
+  const record = asRecord(value);
+  if (!record) return null;
+
+  for (const key of ["TaskId", "TaskID"]) {
+    const taskId = directGuid(record[key]);
+    if (taskId) return taskId;
+  }
+  if ("Result" in record) {
+    const taskId = taskIdFromResult(record.Result);
+    if (taskId) return taskId;
+  }
+
+  const looksLikeTask = ["State", "StartTime", "EndTime", "Origin"].some((key) => key in record);
+  return looksLikeTask ? directGuid(record.Id ?? record.ID) : null;
+}
+
+function controllerTaskFinished(task: AmpRecord) {
+  return Boolean(task.EndTime) || task.Status === false;
+}
+
 async function waitForControllerTask(result: unknown, timeoutMs = defaultWaitTimeoutMs) {
-  const taskId = findGuid(result);
+  const taskId = taskIdFromResult(result);
   if (!taskId) return null;
   const deadline = Date.now() + timeoutMs;
   while (Date.now() <= deadline) {
     const task = asArray(await ampRequest("Core", "GetTasks"))
       .map(asRecord)
       .find((candidate) => candidate && pickString(candidate, "Id", "ID")?.toLowerCase() === taskId.toLowerCase());
-    if (task && (task.EndTime || task.Status === false || [2, 3, 4].includes(Number(task.State)))) {
+    if (task && controllerTaskFinished(task)) {
       assertAmpAccepted(`task ${taskId}`, task);
       return task;
     }
@@ -1334,7 +1442,7 @@ server.registerTool(
     }),
   },
   async ({ username, password, token, rememberMe }) => {
-    const result = await loginAndRefresh({
+    const result = await loginControllerWithBackoff({
       username,
       password,
       token: token ?? "",
@@ -1359,7 +1467,7 @@ server.registerTool(
       throw new Error("Set AMP_USERNAME and AMP_PASSWORD in the MCP environment or .env before using amp_login_from_env.");
     }
 
-    const result = await loginAndRefresh({
+    const result = await loginControllerWithBackoff({
       username,
       password,
       token: process.env.AMP_TOKEN ?? "",
@@ -1399,6 +1507,8 @@ server.registerTool(
       hasToken: Boolean(process.env.AMP_TOKEN),
       hasControllerSession: Boolean(sessionId),
       hasManagedSession: Boolean(managedInstance && managedSessions.has(instanceIdOf(managedInstance))),
+      controllerAuthFailures: controllerAuthRetry.failures,
+      controllerAuthRetryAfterMs: Math.max(0, controllerAuthRetry.retryAt - Date.now()),
       policyEnabled,
       policyGroup,
       policyLocked,
@@ -2008,7 +2118,10 @@ server.registerTool(
 );
 }
 
-function createServer() {
+// serveStdio may request a fresh protocol server during version fallback. AMP connection
+// state is intentionally process-scoped because this executable serves one stdio client.
+// A future multi-client HTTP entry point must create the AMP state per MCP session too.
+function createStdioServer() {
   const server = new McpServer({ name: "amp-http-mcp-server", version: "1.0.0" });
   registerTools(server);
   return server;
@@ -2061,6 +2174,33 @@ function checkPathHandling() {
   }
 }
 
+function checkAuthBackoffAndTaskIds() {
+  const retry: AuthRetryState = { failures: 0, retryAt: 0 };
+  const before = Date.now();
+  recordAuthRejection(retry);
+  const after = Date.now();
+  if (retry.failures !== 1 || retry.retryAt < before + authRetryBaseMs || retry.retryAt > after + authRetryBaseMs) {
+    throw new Error("Authentication retry cooldown calculation regressed.");
+  }
+  try {
+    assertAuthRetryAllowed("Test", retry);
+    throw new Error("Authentication retry cooldown allowed an immediate retry.");
+  } catch (error) {
+    if (!(error instanceof Error) || !error.message.includes("cooling down")) throw error;
+  }
+  clearAuthRetry(retry);
+  if (Number(retry.failures) !== 0 || retry.retryAt !== 0) throw new Error("Authentication retry cooldown reset regressed.");
+
+  const unrelated = "11111111-1111-4111-8111-111111111111";
+  const expectedTask = "22222222-2222-4222-8222-222222222222";
+  if (taskIdFromResult({ Id: unrelated, InstanceID: unrelated, Result: expectedTask }) !== expectedTask) {
+    throw new Error("Controller task extraction selected an unrelated GUID.");
+  }
+  if (!controllerTaskFinished({ EndTime: "2026-01-01T00:00:00Z", Status: true })) {
+    throw new Error("Controller task completion detection regressed.");
+  }
+}
+
 async function checkPolicyGuards() {
   if (!policyEnabled) return;
   for (const [moduleName, methodName] of [["ADSModule", "StopAllInstances"], ["Core", "DeleteUser"]]) {
@@ -2075,6 +2215,7 @@ async function checkPolicyGuards() {
 
 async function selfTest() {
   checkPathHandling();
+  checkAuthBackoffAndTaskIds();
   await checkPolicyGuards();
   const modules = Object.keys(cachedSpec);
   const methods = modules.reduce((sum, moduleName) => sum + Object.keys(cachedSpec[moduleName] ?? {}).length, 0);
@@ -2111,7 +2252,7 @@ async function main() {
     await selfTest();
     return;
   }
-  const handle = serveStdio(createServer);
+  const handle = serveStdio(createStdioServer);
   console.error(`amp-http-mcp-server connected for ${baseUrl}`);
   const shutdown = async () => {
     await handle.close();
