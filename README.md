@@ -93,6 +93,31 @@ If you run this from Codex, you can put the same values under `[mcp_servers.amp.
 
 You can also provide `AMP_SESSION_ID`, but `amp_login` or `amp_login_from_env` is usually cleaner because the server stores the session in memory and redacts it from tool output.
 
+## Bundled Skill: guided game server setup
+
+`skills/amp-game-server-setup/` is a Claude Code skill that walks an agent through creating a game
+server on AMP: it interviews the user (basic or advanced depth, every value skippable), picks free
+ports, and then follows the ordering AMP actually requires — create auto-configured, move ports,
+install the app, and only then write settings. It carries the failure modes documented in this
+README so an agent does not have to rediscover them: `autoConfigure: false` producing an unmanageable
+instance, settings nodes not existing until the app is installed, `SetConfigs` returning a bare
+`false`, and stale sessions.
+
+Install it explicitly:
+
+```bash
+npm run install-skill
+```
+
+That copies the skill into `~/.claude/skills/` (override with `CLAUDE_SKILLS_DIR`, overwrite with
+`-- --force`), then restart Claude Code. It is a command rather than a `postinstall` hook on
+purpose: installing an MCP server should not quietly write into your Claude configuration, and a
+skill that appears without being asked for is a surprise even when it is a useful one.
+
+Per-game specifics live in `skills/amp-game-server-setup/references/` — `minecraft.md` for the
+`MinecraftModule` family and `generic-games.md` for the `GenericModule` templates that cover Necesse,
+Valheim, Palworld and most SteamCMD titles.
+
 ## Codex Skill
 
 This repo includes a Codex skill at `.agents/skills/amp-mcp`. It teaches Codex how to use the friendly AMP MCP tools, diagnose missing environment/policy setup, avoid treating `amp_api_spec` as a raw AMP module, and keep operations inside the configured policy group.
@@ -276,6 +301,194 @@ When the MCP policy is enabled:
 - Managed instance login is retried for a short period after start/restart so clients can use simple one-step flows.
 
 This policy is a guardrail in this MCP server. It is not a replacement for AMP permissions. You should still use least-privilege AMP roles because anyone with direct API access can bypass this wrapper.
+
+## What The Automation Account Can And Cannot Do
+
+Least privilege has a sharp edge worth knowing before an agent hits it mid-task: the grants that
+let the account run a server are separate from the grants that let it configure one. A typical
+non-super-admin automation role can create instances, move their ports, install and update the
+game, start and stop it, read the console and use the file manager — and still be unable to change
+a single game setting.
+
+| Action | Permission node | Granted on the reference deployment |
+| --- | --- | --- |
+| Create an instance | `ADS.InstanceManagement.CreateInstance` | yes |
+| Change instance ports (`ADSModule/SetInstanceNetworkInfo`) | `ADS.InstanceManagement.Reconfigure` | yes |
+| Install/update the game (`Core/UpdateApplication`) | `Core.AppManagement.UpdateApplication` | yes |
+| Start/stop/restart the app, read and write console | `Core.AppManagement.*` | yes |
+| File manager, including SFTP | `FileManager.FileManager.*` | yes |
+| Delete an instance | `ADS.InstanceManagement.DeleteInstances` | yes |
+| **Write instance settings (`Core/SetConfig`, `Core/SetConfigs`)** | **`Settings.*`** | **no** |
+| Read user/role info | `Core.UserManagement.ViewUserInfo` | no |
+
+### Which `Settings.*` nodes a game instance needs
+
+A setting's permission node is the setting's own node prefixed with `Settings.`, so
+`Meta.GenericModule.world` needs `Settings.Meta.GenericModule.world`. Grant the parent to cover a
+whole group. `Core/GetPermissionsSpec`, which requires no permissions, prints the exact tree for
+whatever app an instance runs — ask the instance rather than guessing, because the family differs by
+module.
+
+**Grant these from the instance's own panel, not the controller's.** Each AMP instance publishes
+permission nodes only for the modules it loads, and the ADS controller does not run a game, so game
+settings are absent from its role editor entirely. Comparing the two trees on the reference
+deployment:
+
+| | `Settings.*` groups offered |
+| --- | --- |
+| Controller (ADS01) | `Core`, `ADSModule`, `FileManagerPlugin`, `EmailSenderPlugin`, `WebRequestPlugin`, `WebhookPlugin`, `steamcmdplugin` |
+| A Necesse instance | the same, minus `ADSModule`, plus **`Meta`**, **`GenericModule`**, `LocalFileBackupPlugin`, `AnalyticsPlugin`, `RCONPlugin` |
+
+So `Settings.Meta.GenericModule` cannot be ticked from the controller's Role Management page — it is
+not missing, it is simply not one of that instance's nodes. Open the game instance itself
+(Configuration > Role Management inside its own panel) and the group appears. It is the same role
+being edited; each instance only contributes its own nodes to the tree it renders.
+
+### Template roles are the real fix for "every new instance needs this again"
+
+If the goal is that new instances simply come with their settings permissions already in place, the
+answer is an AMP **template role**, not this API. Assign a template role its permissions inside one
+instance of a game, and those permissions carry to other instances automatically. Two caveats:
+template roles need AMP's Advanced edition or above, and game-specific metaconfig only transfers to
+instances of the *same* game — generic abilities like start/stop/read-console carry everywhere.
+
+Template roles are configured in the web UI and have **no API surface**: across the entire spec the
+only role methods are `Core.CreateRole/DeleteRole/RenameRole/SetAMPRolePermission/SetAMPUserRoleMembership`
+plus the `GetRole*` readers, and every method named "Template" belongs to `ADSModule` and refers to
+*deployment* templates for provisioning instances. `CreateRole`'s `AsCommonRole` flag is a different
+feature again: a global role is one that exists in both ADS and individual instances, rather than
+only inside an instance. It does not propagate permissions between instances.
+
+### Granting through the API instead
+
+Where template roles are unavailable, or to fix up instances that already exist, or to cover the
+first instance of a new game whose metaconfig has nothing to propagate from yet,
+`Core/SetAMPRolePermission` exists on the instance and takes the node directly, so
+`amp_grant_app_settings` routes the grant to the instance for you:
+
+```bash
+amp_grant_app_settings {"role": "mcp-user", "nodes": ["Settings.Meta.GenericModule"], "instance": "Necesse03"}
+```
+
+This needs a one-time bootstrap that a super admin performs from the **controller** panel, where the
+nodes are visible: grant the automation role `Core.RoleManagement.ViewRoles` and
+`Core.RoleManagement.EditRolePermissions`. After that every future instance can be granted its own
+settings nodes through the API, with no web UI step.
+
+**Understand what that bootstrap means.** A role that can edit role permissions can grant itself
+anything, so in AMP terms the account becomes equivalent to a super admin, and the least-privilege
+setup above stops being a real boundary. `amp_grant_app_settings` narrows the blast radius by
+refusing every node that is not an application setting — `Settings.Core.*` (AMP's own security,
+webserver and login configuration) and every non-`Settings` family such as `Core.RoleManagement.*`,
+`ADS.*` and `Instances.*` are rejected. That is a guardrail against mistakes, not against an
+attacker: anyone holding the credentials can call `Core/SetAMPRolePermission` directly and bypass
+this wrapper. If that trade is not one you want, leave the bootstrap ungranted and tick the settings
+group by hand once per instance instead.
+
+Permissions are read at login, so call `amp_clear_session` after a grant before relying on it.
+
+| App type | Grant | Covers |
+| --- | --- | --- |
+| Template-driven games (`GenericModule`: Necesse, most SteamCMD titles) | `Settings.Meta.GenericModule` | world name, MOTD, server password, owner, player limit, PvP/gameplay values — every setting from the app's config manifest |
+| Minecraft | `Settings.MinecraftModule.Minecraft`, `.Game`, `.Limits` | MOTD, level name, seed, view distance; difficulty, gamemode, PvP, whitelist; max players |
+| Minecraft, JVM tuning | `Settings.MinecraftModule.Java` | heap size, Java version |
+| Mods via Steam Workshop | `Settings.steamcmdplugin.SteamWorkshop` | workshop item IDs |
+| Backup policy | `Settings.LocalFileBackupPlugin.Limits` | count, size caps, compression |
+| Sleep/idle behaviour | `Settings.GenericModule.Limits` or `Settings.MinecraftModule.Limits` | sleep mode, retry count |
+
+For the day-to-day job of configuring a game server, the first row is the one that matters. On a
+`GenericModule` app, `Settings.Meta.GenericModule` alone unblocks everything an operator normally
+touches. Nothing under `Settings.Core.*` is needed for game administration — that group is AMP's own
+security, webserver and login configuration, and is best left ungranted.
+
+**The file manager is not a way around a missing `Settings.*` grant.** Editing the app's config
+file directly looks like an obvious workaround, especially since `FileManager.FileManager.*` is
+usually granted in full, and it does not work: AMP holds exclusive control of the files named in a
+template's `ExclusiveControlFilenames` and rewrites them from its own config store every time the
+app starts. Verified on Necesse — `cfg/server.cfg` was edited through the file manager, the app
+restarted, and AMP had reverted every changed value. Configuration has to go through `Core/SetConfig`,
+which needs the grant.
+
+The `Settings.*` gap is the one that bites. It means a freshly created server runs on its template
+defaults and the values an operator actually cares about — server password, admin/owner name, world
+name, MOTD, slot count — have to be set from the AMP web UI by a super admin. `Core/SetConfigs`
+signals this badly: it returns a bare `false` rather than an error, so this server converts that
+into a real failure that names the likely cause and tells you to retry with `Core/SetConfig`, which
+does report AMP's reason.
+
+Call `amp_permissions` to see what the account actually holds, before planning work that depends on
+it. That reads the effective permission list `Core/Login` returns, already resolved across every role
+the account belongs to, and it is the only source worth trusting. The two obvious alternatives both
+mislead:
+
+- **`Core/CurrentSessionHasPermission` answers only for the session it runs on.** Run against a
+  managed instance it reports that instance's context, so controller-scoped `ADS.*` nodes come back
+  `false` even when the account plainly holds them. On this deployment
+  `ADS.InstanceManagement.CreateInstance` reads `false` from a managed session on an account that
+  creates instances successfully.
+- **The role checkboxes in AMP's web panel do not show the union.** Each role's editor shows only
+  what that role contributes, so an account in several roles can show a node unchecked everywhere
+  and still hold it. Two separate role dumps from this deployment showed
+  `ADS.InstanceManagement.DeleteInstances` as unchecked while `Core/Login` reports it as granted.
+
+Permission denials raised through `amp_call` carry a `[permissions]` hint naming the node to grant.
+Granting is a super-admin action in AMP's Configuration > Role Management.
+
+## Creating Instances
+
+Always create with `autoConfigure: true` (the default). AMP builds an `autoConfigure: false`
+instance in standalone management mode with its own local admin account, which the controller
+credentials cannot log into — every managed call then fails with `Core/Login returned no session
+ID`, and `ADSModule/ReactivateInstance` does not repair it. The instance has to be deleted from the
+web UI.
+
+Wanting specific ports is not a reason to pass `false`. Create the instance auto-configured, then
+move its ports:
+
+```bash
+amp_call ADSModule/GetInstanceNetworkInfo {"InstanceName": "Necesse03"}
+amp_call ADSModule/SetInstanceNetworkInfo {"InstanceId": "<guid>", "PortMappings": {"GenericModule.App.Ports.$GamePort": 50004, "FileManagerPlugin.SFTP.SFTPPortNumber": 50005}, "mustStop": true}
+```
+
+The `PortMappings` keys are the `ProvisionNodeName` values from `GetInstanceNetworkInfo`. Note that
+`ADSModule/ApplyInstanceConfiguration` accepts port arguments and silently does not apply them —
+use `SetInstanceNetworkInfo`.
+
+### Configure after creation, not during it
+
+AMP decides a lot for itself while provisioning and quietly discards the rest. `FriendlyName` is the
+clearest case: pass one to `CreateInstance` on the autoConfigure path and AMP stores the internal
+instance name instead, with no error. `amp_create_instance` now waits for the new instance to become
+visible and re-applies the friendly name through `UpdateInstanceInfo`, reporting the outcome in the
+result's `postCreateConfig` field.
+
+Treat the same rule as general. Creation makes the instance exist; everything else belongs after it:
+
+1. Create (auto-configured).
+2. Move ports with `SetInstanceNetworkInfo`.
+3. Install the app with `Core/UpdateApplication`.
+4. Only now set application settings with `Core/SetConfig`.
+
+Step 4 cannot be pulled earlier. An app's settings nodes come from its config manifest, which does
+not exist until the app is installed — on a fresh Necesse instance `Meta.GenericModule.world` returns
+`No such node` until `UpdateApplication` has run. `provisionSettings` at create time is not a
+substitute; it feeds AMP's provisioning template, not the app's own configuration.
+
+## Stale Sessions
+
+AMP decides which instances a session can see, and what its API spec contains, when that session
+logs in. A session opened before something changed keeps reporting the old world. This surfaces as
+errors that have nothing to do with what you just did:
+
+- `The requested instance is not available at this time`
+- `You do not have permission ... requires the Session.Exists permission`
+- `Unknown AMP method "Core/GetStatus"` for a method that plainly exists
+- an instance missing from `amp_status` that `ADSModule/GetLocalInstances` shows
+- a login cooldown after a single transient error
+
+`amp_clear_session` fixes all of them. It drops the session, cached specs, selection and cooldowns
+while keeping credentials, so the next call logs in again. `amp_create_instance` now does this
+automatically, since the session that created an instance cannot see it.
 
 ## File Manager Warning
 

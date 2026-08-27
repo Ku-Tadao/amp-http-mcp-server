@@ -56,6 +56,10 @@ let loginCredentials = {
   token: process.env.AMP_TOKEN ?? "",
 };
 let cachedSpec: AmpSpec = fallbackSpec as AmpSpec;
+// Effective permissions for the logged-in account, as returned by Core/Login on the
+// controller, and per instance because instance-scoped grants differ from it.
+let grantedPermissions: string[] = [];
+const managedPermissions = new Map<string, string[]>();
 let policyEnabled = process.env.AMP_POLICY_ENABLED !== "false";
 let policyGroup = process.env.AMP_POLICY_GROUP ?? "AI";
 const policyLocked = process.env.AMP_POLICY_LOCKED !== "false";
@@ -88,6 +92,10 @@ const defaultMaxReadBytes = positiveEnvNumber("AMP_MAX_READ_BYTES", 1048576, tru
 const defaultHttpTimeoutMs = positiveEnvNumber("AMP_HTTP_TIMEOUT_MS", 30000, true, 4294967295);
 const authRetryBaseMs = positiveEnvNumber("AMP_AUTH_RETRY_BASE_MS", 60000, true, 4294967295);
 const authRetryMaxMs = positiveEnvNumber("AMP_AUTH_RETRY_MAX_MS", 900000, true, 4294967295);
+// Safety net for amp_create_instance's wait for a new instance to report Running.
+// Provisioning is watched via its actual status, so this only bounds a stuck create.
+const postCreateConfigTimeoutMs = positiveEnvNumber("AMP_POST_CREATE_CONFIG_TIMEOUT_MS", 300000, true, 4294967295);
+const instanceStatusPollMs = positiveEnvNumber("AMP_INSTANCE_STATUS_POLL_MS", 5000, true, 600000);
 if (authRetryMaxMs < authRetryBaseMs) {
   throw new Error("AMP_AUTH_RETRY_MAX_MS must be greater than or equal to AMP_AUTH_RETRY_BASE_MS.");
 }
@@ -194,10 +202,12 @@ const managedSpecs = new Map<string, AmpSpec>();
 function resetConnectionState(clearControllerSession = true) {
   if (clearControllerSession) sessionId = "";
   cachedSpec = fallbackSpec as AmpSpec;
+  grantedPermissions = [];
   controllerLoginPromise = null;
   clearAuthRetry(controllerAuthRetry);
   managedInstance = null;
   managedSessions.clear();
+  managedPermissions.clear();
   managedLoginPromises.clear();
   managedAuthRetries.clear();
   managedSpecs.clear();
@@ -215,8 +225,32 @@ async function getManagedSpec(instance = managedInstance) {
   const cached = managedSpecs.get(id);
   if (cached) return cached;
   const spec = (await ampRequest("Core", "GetAPISpec", {}, instance)) as AmpSpec;
-  managedSpecs.set(id, spec);
+  // An unauthenticated instance returns a stub Core module holding only the login
+  // methods. Caching that stub makes every later call fail with "Unknown AMP
+  // method", long after the session recovered, so only cache a real spec.
+  if (isAuthenticatedSpec(spec)) managedSpecs.set(id, spec);
   return spec;
+}
+
+// Core/GetStatus is present for any authenticated session and absent from the
+// pre-login stub, which advertises only Login/GetAPISpec and friends.
+function isAuthenticatedSpec(spec: AmpSpec | null | undefined) {
+  return Boolean(spec?.Core?.GetStatus);
+}
+
+// AMP's bulk setters (Core/SetConfigs and friends) answer a refused write with a
+// bare `false` and no reason, which reads as success to anything that only checks
+// for an error object. Turn it into the failure it is, and point at the singular
+// form, which does return AMP's actual reason.
+function assertSetterApplied(moduleName: string, methodName: string, result: unknown) {
+  if (result !== false || !/^Set[A-Z]/.test(methodName)) return;
+  const singular = methodName.endsWith("s") ? methodName.slice(0, -1) : "";
+  const retry = singular
+    ? ` Retry one value at a time with ${moduleName}/${singular} to get AMP's reason.`
+    : "";
+  throw new Error(
+    `AMP rejected ${moduleName}/${methodName}: it returned false and applied nothing, without saying why.${retry} The usual cause is that this AMP user's role lacks the Settings.* permission for these nodes; only a super admin can grant it, or make the change from the AMP web UI.`,
+  );
 }
 
 async function resolveMethodMeta(moduleName: string, methodName: string, instance: AmpInstance | null) {
@@ -387,6 +421,11 @@ async function ensureManagedSession(instance: AmpInstance, timeoutMs = defaultMa
         }
         if (managedSessions.has(id)) {
           managedAuthRetries.delete(id);
+          // An instance resolves permissions for itself, and its answer differs from
+          // the controller's: a template role can grant Settings.Meta.* on every
+          // instance while the controller login never lists it. Keep the instance's
+          // own list so permission questions are answered where they are decided.
+          managedPermissions.set(id, readPermissions(result));
           return;
         }
         throw new AmpAuthenticationRejectedError("AMP accepted managed Core/Login but returned no session ID.");
@@ -536,8 +575,31 @@ async function loginAndRefresh(params: { username: string; password: string; tok
   }
   if (!sessionId) throw new AmpAuthenticationRejectedError("AMP accepted Core/Login but returned no session ID.");
   loginCredentials = { username: params.username, password: params.password, token: params.token };
+  grantedPermissions = readPermissions(result);
   cachedSpec = await refreshControllerSpec();
   return result;
+}
+
+// Core/Login hands back the account's effective permissions, resolved across every
+// role it belongs to. That is the only trustworthy answer: AMP's role editor shows
+// per-role checkboxes that do not reflect the union, and Core/CurrentSessionHasPermission
+// answers for one session's scope rather than the account's.
+function readPermissions(loginResult: unknown) {
+  const record = asRecord(loginResult);
+  const raw = record?.permissions ?? record?.Permissions;
+  return asArray(raw).filter((entry): entry is string => typeof entry === "string");
+}
+
+// Bounds what amp_grant_app_settings will hand out. An account allowed to edit its
+// own role can otherwise escalate to anything, so only an app's own settings pass:
+// Settings.Core.* is AMP's security, webserver and login configuration, and every
+// non-Settings family (Core.RoleManagement, ADS.*, Instances.*) is refused outright.
+function isGrantableAppSettingNode(node: string) {
+  return /^Settings\./i.test(node) && !/^Settings\.Core\./i.test(node);
+}
+
+function hasPermission(node: string) {
+  return grantedPermissions.some((granted) => granted === node || (granted.endsWith(".*") && node.startsWith(granted.slice(0, -1))));
 }
 
 function isAmpError(value: unknown) {
@@ -586,8 +648,28 @@ function actionResultValue(value: unknown) {
 function assertAmpAccepted(context: string, value: unknown) {
   if (isAmpError(value) || isActionFailure(value)) {
     const message = getAmpErrorMessage(value) || actionMessage(value) || "AMP returned an error.";
-    throw new Error(`AMP rejected ${context}: ${message}`);
+    throw new Error(`AMP rejected ${context}: ${message}${permissionHint(context, message)}`);
   }
+}
+
+// AMP's permission denials are inconsistent: method-level ones name the node they
+// want, but setting-level ones ("does not have permission to modify setting 'X'")
+// name nothing an operator can act on. Say what to grant, in both cases.
+function permissionHint(context: string, message: string) {
+  if (!/\bpermission\b/i.test(message)) return "";
+
+  const [moduleName, methodName] = context.split("/");
+  const settingNode = /modify setting '([^']+)'/i.exec(message)?.[1];
+  const required = findMethodMeta(moduleName ?? "", methodName ?? "")?.RequiredPermissions ?? [];
+
+  // A setting's permission node is its own node prefixed with "Settings.", so the
+  // denial can name exactly what to tick rather than gesturing at Settings.*.
+  const needs = settingNode
+    ? `The AMP user's role needs Settings.${settingNode}, or the parent Settings.${settingNode.split(".").slice(0, -1).join(".")} to cover the whole group (writing instance settings is a separate grant from starting/updating the app).`
+    : required.length
+      ? `The AMP user's role needs ${required.join(" and ")}.`
+      : "The AMP user's role is missing a permission node for this call.";
+  return ` [permissions] ${needs} Only an AMP super admin can grant it (Configuration > Role Management); otherwise do this step from the AMP web UI. Call amp_permissions for the account's effective grants; do not use Core/CurrentSessionHasPermission for this, because it answers only for the session it runs on and reports false for controller-scoped ADS.* nodes even when the account holds them.`;
 }
 
 function asArray(value: unknown): unknown[] {
@@ -923,6 +1005,92 @@ async function resolvePolicyInstance(query?: string, allowCurrent = true) {
   throw new Error(
     `No instance in display group "${policyGroup}" matched "${query}". Allowed instances: ${instances.map((instance) => instanceLabel(instance)).join(", ")}`,
   );
+}
+
+// AMP's CreateInstance takes a FriendlyName and then, on the autoConfigure path,
+// stores the internal instance name instead. Anything else AMP decides for itself
+// during provisioning is silently dropped the same way, so treat creation as
+// "make the instance exist" only and apply configuration once it does.
+async function applyPostCreateConfig(
+  instanceId: string,
+  wanted: { friendlyName: string; description?: string; displayImageSource?: string },
+  timeoutMs: number,
+) {
+  const { running, lastSeen } = await waitForInstanceRunning(instanceId, timeoutMs);
+  if (!running) {
+    return {
+      status: "deferred",
+      detail: lastSeen
+        ? "The instance exists but has not reported Running yet, so nothing was applied. Re-apply with ADSModule/UpdateInstanceInfo once amp_instances lists it."
+        : "The instance has not appeared in ADSModule/GetInstanceStatuses yet, so nothing was applied. It is still provisioning; check amp_instances shortly.",
+    };
+  }
+
+  const instance = await revealNewInstance(instanceId);
+  if (!instance) {
+    return {
+      status: "deferred",
+      detail:
+        "The instance is running but did not appear in the policy group after a fresh login, so nothing was applied. Check that it landed in the expected display group.",
+    };
+  }
+
+  if ((instance.FriendlyName ?? "") === wanted.friendlyName && !wanted.description && !wanted.displayImageSource) {
+    return { status: "not needed", detail: "AMP kept the requested friendly name." };
+  }
+
+  try {
+    await callAdsMethod("UpdateInstanceInfo", {
+      InstanceId: instanceId,
+      FriendlyName: wanted.friendlyName,
+      Description: wanted.description ?? "",
+      DisplayImageSource: wanted.displayImageSource,
+    });
+    return {
+      status: "applied",
+      detail: `AMP stored the friendly name as "${instance.FriendlyName ?? ""}" during creation; corrected to "${wanted.friendlyName}".`,
+    };
+  } catch (error) {
+    return {
+      status: "failed",
+      detail: `${error instanceof Error ? error.message : String(error)} The instance exists and works; only its display name is wrong.`,
+    };
+  }
+}
+
+// Wait for the instance itself to report a state, rather than guessing at a
+// duration. ADSModule/GetInstanceStatuses is the endpoint to ask: unlike
+// GetInstances it is not filtered by the session's visible-instance set, so it
+// reports the new instance as soon as AMP creates it, and it carries Running so
+// "provisioned" is an observed fact instead of an elapsed-time bet.
+async function waitForInstanceRunning(instanceId: string, timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+  let lastSeen: AmpRecord | null = null;
+  for (;;) {
+    try {
+      lastSeen =
+        asArray(await ampRequest("ADSModule", "GetInstanceStatuses"))
+          .map(asRecord)
+          .find((entry) => String(entry?.InstanceID ?? entry?.InstanceId ?? "").toLowerCase() === instanceId.toLowerCase()) ?? null;
+      if (lastSeen?.Running === true) return { running: true as const, lastSeen };
+    } catch {
+      // A create briefly unsettles the controller; keep polling until the deadline.
+    }
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) return { running: false as const, lastSeen };
+    await sleep(Math.min(instanceStatusPollMs, remainingMs));
+  }
+}
+
+// Once the instance is running it exists as far as AMP is concerned, but the
+// current session still cannot see it: a session's visible instances are fixed at
+// login. One re-login now makes it visible, and unlike polling GetInstances it is
+// a single deterministic step rather than a retry loop.
+async function revealNewInstance(instanceId: string) {
+  const selectedBefore = managedInstance;
+  resetConnectionState();
+  managedInstance = selectedBefore;
+  return (await getPolicyInstances()).find((instance) => instanceIdOf(instance) === instanceId) ?? null;
 }
 
 async function callAdsMethod(methodName: string, params: Record<string, unknown>) {
@@ -1478,9 +1646,119 @@ server.registerTool(
 );
 
 server.registerTool(
+  "amp_grant_app_settings",
+  {
+    description:
+      "Grant (or revoke) an AMP role's permission to change one instance's application settings. Game-settings nodes such as Settings.Meta.GenericModule exist only inside the instance that runs the app, never on the ADS controller, which is why they cannot be ticked from the controller's Role Management page - this routes the call to the instance instead. If the goal is that every NEW instance already has these permissions, an AMP template role is the better answer and this tool is not it: a template role propagates permissions to other instances of the same game automatically, but it needs Advanced edition and is web-UI only, with no API. Use this tool where template roles are unavailable, to fix up existing instances, or for the first instance of a new game. Requires the account to hold Core.RoleManagement.ViewRoles and Core.RoleManagement.EditRolePermissions, granted once by a super admin from the controller. Only Settings.* nodes are accepted, and Settings.Core.* is refused because that is AMP's own security, webserver and login configuration rather than anything to do with a game.",
+    annotations: { title: "Grant app settings permission", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    inputSchema: z.object({
+      role: z.string().min(1).describe("Role name, for example the role the MCP account belongs to. Case-insensitive."),
+      nodes: z.array(z.string().min(1)).min(1).describe("Settings.* permission nodes to change, for example [\"Settings.Meta.GenericModule\"]. A parent node covers its whole group."),
+      instance: z.string().optional().describe("Instance whose permission tree defines these nodes. Omit to use the selected instance."),
+      enabled: z.boolean().optional().describe("True to grant (default), false to revoke."),
+    }),
+  },
+  async ({ role, nodes, instance, enabled }) => {
+    // The node allowlist is the point of this tool rather than an afterthought: an
+    // account that can edit its own role can otherwise grant itself anything,
+    // including Core.RoleManagement and ADS.*, which would quietly turn a
+    // least-privilege automation account into a super admin.
+    const refused = nodes.filter((node) => !isGrantableAppSettingNode(node));
+    if (refused.length) {
+      throw new Error(
+        `Refusing to change ${refused.join(", ")}. This tool only grants application settings: nodes must start with "Settings." and must not be under "Settings.Core." (AMP's own security, webserver and login settings). Change anything else from the AMP web UI deliberately.`,
+      );
+    }
+
+    const target = await resolvePolicyInstance(instance);
+    if (!target) throw new Error("No instance is selected. Call amp_use_instance first, or pass instance.");
+
+    const roleIds = asRecord(await callManagedMethod(target, "Core", "GetRoleIds"));
+    const match = Object.entries(roleIds ?? {}).find(([, name]) => String(name).toLowerCase() === role.toLowerCase());
+    if (!match) {
+      throw new Error(`No AMP role named "${role}". Available roles: ${Object.values(roleIds ?? {}).join(", ") || "none visible"}.`);
+    }
+    const [roleId, roleName] = match;
+
+    const results: Record<string, string> = {};
+    for (const node of nodes) {
+      try {
+        await callManagedMethod(target, "Core", "SetAMPRolePermission", {
+          RoleId: roleId,
+          PermissionNode: node,
+          Enabled: enabled ?? true,
+        });
+        results[node] = enabled === false ? "revoked" : "granted";
+      } catch (error) {
+        results[node] = `failed: ${error instanceof Error ? error.message : String(error)}`;
+      }
+    }
+
+    return textResult({
+      instance: summarizeInstance(target),
+      role: roleName,
+      roleId,
+      results,
+      note: "Permissions are read at login, so call amp_clear_session before relying on a change made here.",
+    });
+  },
+);
+
+server.registerTool(
+  "amp_permissions",
+  {
+    description:
+      "Report what this AMP account is actually allowed to do, from the effective permission list Core/Login returns. Use it before planning work that depends on a permission, and after any permission denial. This is the authoritative answer: it is resolved across every role the account belongs to, unlike AMP's per-role checkboxes in the web panel, and unlike Core/CurrentSessionHasPermission which answers only for the scope of the session it runs on (controller-scoped ADS.* nodes read false from a managed-instance session even when the account holds them). Pass nodes to test specific permissions.",
+    annotations: { title: "Show effective AMP permissions", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    inputSchema: z.object({
+      nodes: z.array(z.string()).optional().describe("Permission nodes to test, for example Settings.Meta.GenericModule or ADS.InstanceManagement.DeleteInstances."),
+      instance: z.string().optional().describe("Report the permissions this account holds ON that instance. Defaults to the selected instance when there is one. Instance-scoped grants, notably game settings from a template role, appear here and NOT in the controller's list, so always ask about the instance you intend to act on."),
+      scope: z.enum(["auto", "controller", "instance"]).optional().describe("auto (default) uses the instance when one is selected or named, else the controller."),
+      includeInstanceGrants: z.boolean().optional().describe("Include the per-instance Instances.<id>.* grants, which are numerous. Defaults to false."),
+    }),
+  },
+  async ({ nodes, instance, scope, includeInstanceGrants }) => {
+    await ensureSession("Core", "GetAPISpec");
+
+    // Ask the instance whenever the caller named or selected one. The controller's
+    // list omits instance-scoped grants entirely, so answering from it produces
+    // confident false negatives for exactly the settings people care about.
+    const wantInstance = scope === "instance" || (scope !== "controller" && (instance || managedInstance));
+    const target = wantInstance ? await resolvePolicyInstance(instance) : null;
+    if (target) await ensureManagedSession(target);
+
+    const effective = target ? managedPermissions.get(instanceIdOf(target)) ?? [] : grantedPermissions;
+    const holds = (node: string) =>
+      effective.some((granted) => granted === node || (granted.endsWith(".*") && node.startsWith(granted.slice(0, -1))));
+
+    const instanceGrants = effective.filter((node) => node.startsWith("Instances."));
+    const globalGrants = effective.filter((node) => !node.startsWith("Instances."));
+
+    return textResult({
+      username: loginCredentials.username || null,
+      scope: target ? `instance: ${instanceLabel(target)}` : "controller",
+      // Game settings live under Settings.Meta.<Module> for template-driven apps and
+      // Settings.<Module> for native ones, so report both rather than guess a module.
+      canWriteGameSettings: {
+        "Settings.Meta.GenericModule": holds("Settings.Meta.GenericModule"),
+        "Settings.MinecraftModule": holds("Settings.MinecraftModule"),
+      },
+      granted: globalGrants,
+      instanceGrantCount: instanceGrants.length,
+      ...(includeInstanceGrants ? { instanceGrants } : {}),
+      ...(nodes?.length ? { checked: Object.fromEntries(nodes.map((node) => [node, holds(node)])) } : {}),
+      note: target
+        ? "These are the permissions this account holds on this instance, which is where instance calls are authorised. They can differ from the controller's list in both directions: a template role can grant Settings.Meta.* here and not there, and applying a template role can also remove Core.AppManagement.* here while the controller still lists it."
+        : "Controller scope. Instance-scoped grants such as game settings are NOT listed here; pass instance to ask the instance that will actually authorise the call.",
+    });
+  },
+);
+
+server.registerTool(
   "amp_clear_session",
   {
-    description: "Forget the stored AMP session ID.",
+    description:
+      "Forget the stored AMP session ID and every cached spec, selection and login cooldown. Credentials are kept, so the next call simply logs in again. This is the first thing to try when a managed call fails for a reason that does not fit what you just did - \"The requested instance is not available at this time\", \"requires the Session.Exists permission\", \"Unknown AMP method\" for a method that plainly exists, an instance that amp_status will not show, or a login cooldown after a one-off error. AMP fixes a session's visible instances and its API spec at login time, so a session opened before something changed keeps reporting the old world until it is replaced.",
     annotations: { title: "Clear cached AMP session", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     inputSchema: z.object({}),
   },
@@ -1986,7 +2264,7 @@ server.registerTool(
 server.registerTool(
   "amp_create_instance",
   {
-    description: `Create a new AMP instance in the configured policy group (${policyGroup}). Auto-configured by default.`,
+    description: `Create a new AMP instance in the configured policy group (${policyGroup}). Auto-configured by default; leave autoConfigure alone unless you have read its description, because autoConfigure:false produces an instance this MCP can never manage. To place the instance on specific ports, create it auto-configured and then move the ports with ADSModule/SetInstanceNetworkInfo (see amp_call). The new instance is invisible to other tools until the AMP session is refreshed; this tool polls the new instance's own status until it reports Running, then re-logs in to reveal it and applies the friendly name, because AMP discards it during provisioning. Treat creation as "make the instance exist" only: application settings (world name, MOTD, passwords, slots) do not exist as config nodes until the app is installed, so install with Core/UpdateApplication first, then set them with Core/SetConfig once the instance is running. Check the postCreateConfig field in the result to see what was applied.`,
     annotations: { title: "Create new instance", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     inputSchema: z.object({
       module: z.string().min(1).describe("AMP module name, for example Minecraft, Valheim, or any module reported by amp_supported_apps."),
@@ -1995,7 +2273,12 @@ server.registerTool(
       instanceName: z.string().optional().describe("Internal instance name. Defaults to a safe name generated from friendlyName."),
       targetADSInstance: z.string().optional().describe("Target ADS instance GUID. Auto-detected when possible."),
       newInstanceId: z.string().optional().describe("New instance GUID. Generated when omitted."),
-      autoConfigure: z.boolean().optional().describe("Let AMP choose ports/settings. Defaults to true."),
+      autoConfigure: z
+        .boolean()
+        .optional()
+        .describe(
+          "Let AMP choose ports/settings. Defaults to true, and should stay true. AMP creates an autoConfigure:false instance in standalone management mode (ManagementMode 0) with its own local admin account, so the controller credentials this MCP holds cannot log into it: every managed call fails with \"Core/Login returned no session ID\" and the instance can never be driven through this MCP. ADSModule/ReactivateInstance does not repair it. Setting specific ports is NOT a reason to pass false - create auto-configured, then move the ports with ADSModule/SetInstanceNetworkInfo. Pass false only to deliberately create a hands-off instance you will manage from the AMP web UI.",
+        ),
       ipBinding: z.string().optional().describe("Used when autoConfigure is false. Defaults to 0.0.0.0."),
       portNumber: z.number().int().nonnegative().optional().describe("Used when autoConfigure is false."),
       adminUsername: z.string().optional().describe("Module admin username if the app requires one. Defaults to admin."),
@@ -2053,8 +2336,47 @@ server.registerTool(
       Group: policyGroup,
     });
 
+    const newInstanceId = String(body.NewInstanceId);
     const result = await callAdsMethod("CreateInstance", body);
-    const task = args.wait ?? true ? await waitForControllerTask(result, args.waitTimeoutMs) : null;
+
+    // AMP decides which instances a session may see when that session logs in, so
+    // the session that just created this instance still cannot see it. Drop the
+    // session (keeping the credentials) so the next call re-logs in and finds it.
+    // This runs in a finally because AMP's create task routinely outlives the wait
+    // timeout: the instance exists either way, and skipping the refresh on the slow
+    // path would leave it invisible in exactly the case that needs the refresh most.
+    // Creating an instance is not a reason to lose the caller's current selection,
+    // so put it back; its managed session is re-established on the next call.
+    // AMP accepted the create before the wait began, so a wait timeout means "still
+    // provisioning", not "failed". Reporting it as an error sends callers hunting for
+    // a problem that does not exist, or worse, creating the instance a second time.
+    let task: unknown = null;
+    let taskTimedOut = "";
+    try {
+      if (args.wait ?? true) task = await waitForControllerTask(result, args.waitTimeoutMs);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!/^Timed out waiting for AMP task/.test(message)) throw error;
+      taskTimedOut = message;
+    } finally {
+      const selectedBefore = managedInstance;
+      resetConnectionState();
+      managedInstance = selectedBefore;
+    }
+
+    // Only after the refreshed session can see the instance is it worth configuring.
+    const postCreateConfig =
+      args.wait ?? true
+        ? await applyPostCreateConfig(
+            newInstanceId,
+            {
+              friendlyName: args.friendlyName,
+              displayImageSource: args.displayImageSource,
+            },
+            postCreateConfigTimeoutMs,
+          )
+        : { status: "skipped", detail: "wait was false, so the instance was not waited for or configured." };
+
     return textResult({
       policyGroup,
       instanceName: safeName,
@@ -2062,9 +2384,23 @@ server.registerTool(
       module: moduleName,
       applicationId: args.applicationId ?? null,
       targetADSInstance,
+      autoConfigure,
       result,
       task,
-      note: `The MCP policy forces this instance into display group "${policyGroup}".`,
+      postCreateConfig,
+      note: `The MCP policy forces this instance into display group "${policyGroup}". The AMP session was refreshed so this instance is visible to the other tools.`,
+      ...(taskTimedOut
+        ? {
+            taskTimedOut:
+              `${taskTimedOut} AMP accepted the create before this wait started, so the instance almost certainly exists and is still provisioning. Do NOT create it again. Check with amp_instances, and raise waitTimeoutMs if you want this tool to wait longer.`,
+          }
+        : {}),
+      ...(autoConfigure
+        ? {}
+        : {
+            warning:
+              "Created with autoConfigure:false, so AMP made this a standalone (ManagementMode 0) instance with its own local admin account. This MCP cannot log into it and cannot manage it. Delete it from the AMP web UI and re-create with autoConfigure:true if that was not intended.",
+          }),
     });
   },
 );
@@ -2113,6 +2449,7 @@ server.registerTool(
     const result = await ampRequest(moduleName, methodName, policyBody, routeInstance);
     await updateManagedInstance(moduleName, methodName, policyBody, result);
     assertAmpAccepted(`${moduleName}/${methodName}`, result);
+    assertSetterApplied(moduleName, methodName, result);
     return textResult(result);
   },
 );
@@ -2213,9 +2550,56 @@ async function checkPolicyGuards() {
   }
 }
 
+// The three failure modes below all used to surface as something misleading, so
+// assert each one still explains itself.
+function checkDiagnosticMessages() {
+  const settingDenial = permissionHint(
+    "Core/SetConfig",
+    "The current user does not have permission to modify setting 'Meta.GenericModule.world'.",
+  );
+  // A setting's permission node is the setting node prefixed with "Settings.".
+  if (!settingDenial.includes("Settings.Meta.GenericModule.world") || !settingDenial.includes("parent Settings.Meta.GenericModule ")) {
+    throw new Error("Setting denials no longer name the exact permission node and its parent group.");
+  }
+  if (!settingDenial.includes("super admin")) {
+    throw new Error("Setting denials no longer say who can grant the permission.");
+  }
+  if (permissionHint("Core/GetStatus", "The specified instance is not running") !== "") {
+    throw new Error("permissionHint fires on errors that are not permission denials.");
+  }
+
+  try {
+    assertSetterApplied("Core", "SetConfigs", false);
+    throw new Error("A bare false from a bulk setter was treated as success.");
+  } catch (error) {
+    if (!(error instanceof Error) || !error.message.includes("Core/SetConfig ")) {
+      throw new Error("SetConfigs failure no longer points at the singular SetConfig.");
+    }
+  }
+  assertSetterApplied("Core", "SetConfigs", true);
+  assertSetterApplied("Core", "GetConfigs", false);
+
+  // An account that can edit its own role could otherwise grant itself anything, so
+  // the allowlist is load-bearing rather than cosmetic. Pin what it must refuse.
+  for (const node of ["Core.RoleManagement.EditRolePermissions", "ADS.InstanceManagement.DeleteInstances", "Instances.abc.Manage", "Settings.Core.Security.TwoFactorMode", "settings.core.login.UseOIDC", ""]) {
+    if (isGrantableAppSettingNode(node)) throw new Error(`amp_grant_app_settings would accept "${node}", which is not an application setting.`);
+  }
+  for (const node of ["Settings.Meta.GenericModule", "Settings.MinecraftModule.Game.Difficulty", "settings.meta.genericmodule.world"]) {
+    if (!isGrantableAppSettingNode(node)) throw new Error(`amp_grant_app_settings would refuse "${node}", which is an application setting.`);
+  }
+
+  if (isAuthenticatedSpec({ Core: { Login: {} } } as unknown as AmpSpec)) {
+    throw new Error("The pre-login stub spec is being treated as authenticated and would be cached.");
+  }
+  if (!isAuthenticatedSpec({ Core: { GetStatus: {} } } as unknown as AmpSpec)) {
+    throw new Error("A real authenticated spec is no longer cacheable.");
+  }
+}
+
 async function selfTest() {
   checkPathHandling();
   checkAuthBackoffAndTaskIds();
+  checkDiagnosticMessages();
   await checkPolicyGuards();
   const modules = Object.keys(cachedSpec);
   const methods = modules.reduce((sum, moduleName) => sum + Object.keys(cachedSpec[moduleName] ?? {}).length, 0);
