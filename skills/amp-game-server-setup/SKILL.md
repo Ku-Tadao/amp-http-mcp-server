@@ -1,175 +1,145 @@
 ---
 name: amp-game-server-setup
-description: Set up a game server on an AMP (CubeCoders) panel through the AMP MCP tools, interviewing the user for the settings that matter and handling AMP's ordering traps. Use this whenever someone wants a new game server created, deployed, provisioned or "spun up" on AMP - Minecraft, Valheim, Necesse, Palworld, Rust, Terraria, Satisfactory, ARK, any of them - and also when they ask to configure, reconfigure or fix the settings of a server that already exists there. Trigger on phrases like "make me a Minecraft server", "set up another Necesse server", "add a modded server", "create an AMP instance", "change my server's difficulty/MOTD/slots", even when AMP is never named, as long as AMP MCP tools are available.
+description: Create and configure game servers on an AMP (CubeCoders) panel through the AMP MCP tools, interviewing the user for the decisions that actually matter and respecting the order AMP requires. Use this whenever someone wants a game server created, deployed, provisioned or "spun up" on AMP - Minecraft, Valheim, Necesse, Palworld, Rust, Terraria, ARK, any of the 240-odd apps it supports - and equally when they want an existing server reconfigured: difficulty, MOTD, slots, whitelist, passwords, mods. Trigger on "make me a Minecraft server", "set up another Necesse server", "add a modded server", "change my server's difficulty", "why won't my server let me set X", even when AMP is never named, as long as AMP MCP tools are available.
 ---
 
-# Setting up a game server on AMP
+# Game servers on AMP
 
-AMP will happily accept a create call and then silently ignore half of what you sent it. Most of
-this skill is about the order things have to happen in, and about asking the user the handful of
-questions that actually change the outcome.
+An app's settings do not exist until the app is installed. `Meta.GenericModule.world` answers
+`No such node` on a Necesse instance that was created ten seconds ago, and no amount of passing
+values to `amp_create_instance` changes that — AMP takes them and drops them.
 
-## Before the interview
+That single fact shapes everything here. You cannot interview someone about their server and then
+build it. You build a shell, install the game, and only then does the server become a thing with
+settings to discuss. So the work splits in two.
 
-Two checks, because both change what you can promise:
+## Phase 1 — enough to create the shell
 
-1. `amp_status` — confirms the MCP is connected and shows what already exists.
-2. `amp_permissions` — the account is often not a super admin.
+Four things, and only these, before anything exists:
 
-Look specifically at whether game settings are writable. If they are not, say so **before** the
-interview rather than collecting a MOTD you cannot apply:
+- **Which game.** `amp_supported_apps` gives the application ID. Necessary for everything else.
+- **A name.** Theirs, or derived from the game and a number.
+- **Ports.** See below — usually you decide these, not them.
+- **Depth.** Basic or advanced, which only changes how much of phase 2 you ask about.
 
-> Heads up: this AMP account can create and run servers but can't write their settings, so I'll get
-> the server up on template defaults and you'll need to set the MOTD and password in the web UI (or
-> have an admin grant the role `Settings.Meta.GenericModule`). Want me to carry on?
+Do not ask about difficulty, MOTD, passwords or mods yet. You cannot apply the answers, and asking
+for values you will have to ask about again later is worse than waiting.
 
-Permissions for game settings are **instance-scoped**, so once an instance exists, ask about that
-instance: `amp_permissions` with `instance: "<name>"`. The controller's list genuinely does not
-include them, and answering from it produces confident false negatives.
+**Ports are your job, not theirs.** Ask only whether they have a forwarded range. Then:
+`amp_call ADSModule/GetLocalInstances` (controller scope) lists *every* instance including ones the
+session cannot otherwise see — `amp_instances` will miss some and you will collide with a port that
+looked free. Take every `ApplicationEndpoints` port and every `Port`, pick the lowest free pair in
+their range, and tell them what you took and that it needs forwarding.
 
-## Basic or advanced
+The same principle covers the whole skill: anything discoverable from the panel is yours to find.
+Available versions, whether an app is installed, what ports are taken, which permissions the account
+holds — look them up. Only decisions belong to the user.
 
-Ask which depth they want, and make the difference concrete rather than abstract:
+## Build the shell
 
-> Do you want the **basic** setup (name, MOTD, ports, difficulty/gamemode, mods — I pick sensible
-> defaults for everything else) or **advanced** (all of the above plus slots, world seed, PvP,
-> whitelist, view distance, backups, memory limits, sleep-when-empty)?
+Order matters; each step is what makes the next possible.
 
-Then interview. Ask in small batches, not one enormous wall of questions — two or three at a time
-reads like a conversation instead of a form.
+1. **`amp_create_instance` with `autoConfigure: true`.** Always. `false` produces a standalone
+   instance with its own local admin account that this MCP can never log into, and nothing repairs
+   it — it has to be deleted. Wanting specific ports is not a reason; ports move in step 2.
+   Creation is slow, and a `taskTimedOut` in the result means it is still provisioning, **not** that
+   it failed. Never create it a second time.
+2. **Move the ports.** `ADSModule/GetInstanceNetworkInfo` gives the `ProvisionNodeName` keys; feed
+   them to `ADSModule/SetInstanceNetworkInfo` with `mustStop: true`.
+   `ApplyInstanceConfiguration` accepts port arguments and silently ignores them.
+3. **Install.** `amp_use_instance`, then `Core/UpdateApplication`. Minutes, not seconds — watch
+   `Core/GetTasks` or `amp_console_read`.
 
-**Every value is skippable, and say so up front.** People often don't care about half of these.
-When someone skips, you have two moves and should pick deliberately:
+Now the server has settings.
 
-- **Auto-fill** when there is an obviously good answer: ports, slots, difficulty, MOTD derived from
-  the server name. Tell them what you chose.
-- **Leave unset** when guessing would be wrong or unsafe: server password, owner/admin name, world
-  seed. Inventing a password the user doesn't know is worse than leaving the server open, and
-  inventing an owner name silently gives admin to nobody.
+## Phase 2 — interview from what the instance actually has
 
-Never invent a value in the second category to avoid an awkward gap. Report it instead.
+`Core/GetSettingsSpec` on the running instance returns every setting the app has, each with its
+display name, description, current value, type, enum options and whether it is required. That is the
+question list, generated from the app in front of you rather than a table someone wrote for a
+different version of a different game. Use it. There are 240 apps and they change.
 
-## What to ask, by depth
+Rank what comes back by **consequence**, because that determines both what to ask in basic mode and
+what a skip means:
 
-Both tiers, every game:
+**Class 1 — access and authority.** Server password, whitelist, owner/admin name. Who can get in and
+who is in charge.
 
-| Question | If skipped |
-| --- | --- |
-| Server name (the panel's display name) | Derive from the game and a number: "Minecraft #2" |
-| MOTD / description shown to players | Reuse the server name |
-| Ports | **Auto-pick — see below.** Always report what you chose |
-| Server password | Leave empty, and warn the port is open to anyone who finds it |
-| Admin/owner name | Leave unset, and say nobody has admin until they set it |
-| Modded? Which loader/modpack? | Vanilla |
+**Class 2 — irreversible or world-defining.** World name or level name, seed, hardcore mode. Changing
+a world name later loads or creates a *different world*; on a server people have played, that reads
+as "our world is gone".
 
-Advanced adds: player slots, difficulty and gamemode specifics, PvP, whitelist, world seed and type,
-view/simulation distance, memory limits, backup policy, sleep-when-empty, auto-start on boot.
+**Class 3 — how it plays.** Difficulty, gamemode, PvP, slots, MOTD, mods.
 
-Per-game settings, their exact AMP config nodes, and sensible defaults live in `references/`:
+**Class 4 — housekeeping.** View distance, memory, backups, sleep-when-empty, idle timeouts.
 
-- `references/minecraft.md` — the `MinecraftModule` family (difficulty, gamemode, Forge/Fabric/Paper, seeds)
-- `references/generic-games.md` — the `GenericModule` template family, which covers Necesse, Valheim,
-  Palworld, Terraria and most SteamCMD titles
+Basic asks classes 1–3. Advanced walks all four. Group questions by class rather than firing them
+one at a time — people answer "difficulty, gamemode, PvP?" in one breath and resent three separate
+messages. Show the current value so they can say "fine" without thinking.
 
-Read the one that matches. If the game is in neither, `Core/GetSettingsSpec` on the running instance
-lists every node it actually has, which beats guessing.
+### Skipping
 
-## Picking ports
+Say up front that anything can be skipped. What a skip *means* depends on the class:
 
-Ask whether they have a range that's port-forwarded. If they don't know, or say "just pick one",
-choose for them:
+- **Classes 3 and 4: auto-fill.** There is an obviously reasonable answer. Take it, and say what you
+  took.
+- **Classes 1 and 2: leave unset, and report it.** Never invent these. A password the user does not
+  know is worse than an open port, because they believe it is secured and cannot get in themselves.
+  An invented owner name grants admin to nobody while looking done. A guessed seed is a world they
+  did not choose.
 
-1. `amp_call ADSModule/GetLocalInstances` (controller scope) — this lists **every** instance,
-   including ones the current session can't otherwise see, so it's the only reliable view of what's
-   taken. `amp_instances` alone will miss some.
-2. Collect every `ApplicationEndpoints` port and every `Port` field.
-3. Pick the lowest free pair in their range, or next to the same game's existing servers so related
-   servers cluster together.
-4. Say which ports you took, and remind them these need forwarding in the router/firewall.
+The failure mode to avoid is a tidy-looking summary that quietly hides a decision nobody made.
 
-## Creating the server
+### Writing the values
 
-The order below is not stylistic — each step exists because the previous one makes it possible.
+`Core/SetConfig`, one node at a time. `SetConfigs` answers a refused write with a bare `false` and no
+reason, which reads exactly like success.
 
-**1. Create, always auto-configured.**
+Then start it — `Core/Start` — and confirm from `amp_console_read` that the game reports listening
+and the game port shows `Listening: true`. A running AMP instance with a closed game port is not a
+working server.
 
-```
-amp_create_instance  module=<module>  applicationId=<id from amp_supported_apps>
-                     friendlyName=<name>  autoConfigure=true  postCreate=DoNothing
-```
+## Reconfiguring a server that already exists
 
-`autoConfigure: false` produces a standalone instance with its own local admin account that the MCP
-can never log into, and no amount of repair fixes it — it has to be deleted. Wanting particular
-ports is not a reason to pass `false`; ports get moved in step 2.
+Phase 2 on its own. Select the instance, read `GetSettingsSpec`, ask about what they raised plus
+anything in class 1 or 2 that is still unset, write, restart if the setting needs it.
 
-Creation is slow. If the result carries `taskTimedOut`, the instance almost certainly exists and is
-still provisioning — **do not create it again**. Check `amp_instances`.
+Check `amp_permissions` with the instance name first. Game-settings permissions are **instance
+scoped**: the controller's list genuinely omits them, so asking the controller produces confident
+false negatives about settings the account can in fact write.
 
-**2. Move the ports.**
+## When a write is refused
 
-```
-amp_call ADSModule/GetInstanceNetworkInfo  {"InstanceName": "<name>"}
-amp_call ADSModule/SetInstanceNetworkInfo  {"InstanceId": "<guid>",
-          "PortMappings": {"<ProvisionNodeName>": <port>, ...}, "mustStop": true}
-```
+A setting's permission node is its own node prefixed with `Settings.` —
+`Meta.GenericModule.world` needs `Settings.Meta.GenericModule.world`, and the parent
+`Settings.Meta.GenericModule` covers the group. These nodes exist only inside the instance running
+the game, never on the ADS controller, which is why they cannot be found in the controller's Role
+Management page and why people conclude they do not exist.
 
-The `PortMappings` keys are the `ProvisionNodeName` values the first call returns, e.g.
-`GenericModule.App.Ports.$GamePort` or `MinecraftModule.Minecraft.PortNumber`, plus
-`FileManagerPlugin.SFTP.SFTPPortNumber`. `ApplyInstanceConfiguration` accepts port arguments and
-silently drops them, so don't reach for it.
-
-**3. Install the game.** `amp_use_instance`, then `amp_call Core/UpdateApplication` (managed scope).
-This is a SteamCMD or Java download and takes minutes. Poll `Core/GetTasks` or `amp_console_read`.
-
-**4. Now apply settings.** Not before. An app's settings nodes come from its config manifest, which
-does not exist until the app is installed — `Meta.GenericModule.world` answers `No such node` on a
-fresh Necesse instance until the update has run.
-
-```
-amp_call Core/SetConfig  {"node": "Meta.GenericModule.motd", "value": "..."}
-```
-
-Use `Core/SetConfig` one node at a time rather than `SetConfigs`. The plural form answers a refused
-write with a bare `false` and no reason, which reads like success.
-
-**5. Start and verify.** `amp_call Core/Start`, then `amp_console_read` until the game reports it is
-listening. Confirm the game port shows `Listening: true` — a running AMP instance whose game port is
-closed is not a working server.
-
-## Handling refusals
-
-**A settings write is denied.** The permission node for a setting is the setting's own node prefixed
-with `Settings.`, so `Meta.GenericModule.world` needs `Settings.Meta.GenericModule.world`, and the
-parent `Settings.Meta.GenericModule` covers the group. These nodes exist only inside the instance
-that runs the game, never on the ADS controller, which is why they can't be found in the controller's
-Role Management page. Options, in order of preference:
-
-1. An admin ticks the group in a **template role**, which then applies to every instance of that
-   game automatically. This is the right fix for "every new server needs this again". Template roles
-   need AMP's Advanced edition and are web-UI only.
-2. `amp_grant_app_settings` does it through the API, if the account holds
-   `Core.RoleManagement.EditRolePermissions`.
-3. The user sets those values in the web UI themselves.
+Best fix first: an admin ticks the group in a **template role**, which then applies to every instance
+of that game automatically — the right answer to "every new server needs this again", though it needs
+AMP's Advanced edition and is web-UI only. Otherwise `amp_grant_app_settings` does it through the
+API, or the user sets those values themselves in the panel.
 
 Editing the config file through the file manager is **not** a workaround. AMP holds exclusive control
-of files like `server.cfg` and rewrites them from its own config store on every app start, so the
-edit silently reverts.
+of files like `server.cfg` and rewrites them from its own store on every app start, so the edit
+reverts silently.
 
-After any permission change, call `amp_clear_session` — permissions are read at login.
+After any permission change, `amp_clear_session` — permissions are read at login.
 
-**Something fails for a reason that doesn't match what you just did** — "instance is not available",
-"requires the Session.Exists permission", "Unknown AMP method" for a method that obviously exists, an
-instance missing from `amp_instances`. That's a stale session. `amp_clear_session`, then retry.
+## When something fails for no reason that fits
 
-## Reporting back
+"Instance is not available", "requires the Session.Exists permission", `Unknown AMP method` for a
+method that obviously exists, an instance missing from `amp_instances` that you just created. These
+are one bug wearing different masks: a session's visible instances and API spec are fixed at login.
+`amp_clear_session`, then retry, before investigating anything else.
 
-Close with what they need to actually play and what's still open. Something like:
+## Closing
 
-> **Minecraft #2** is up on `:25566`, Paper 1.21, normal difficulty, survival, 10 slots, whitelist off.
->
-> - Ports 25566 (game) and 25567 (SFTP) — these need forwarding on your router.
-> - No server password set, so anyone who finds the port can join.
-> - No operator set yet — tell me your in-game name and I'll set it.
+Report what they need in order to play, then every value you chose for them and every one you left
+unset. Those two lists are the point — a summary that omits them is how someone discovers three weeks
+later that their server never had a password.
 
-Always call out the values you auto-filled and the ones you left unset, so nothing you chose on
-their behalf is a surprise later.
+`references/game-notes.md` holds the handful of per-game judgments a settings spec cannot express,
+such as Minecraft's EULA and which games hide a destructive change behind an innocuous-looking field.
+Read it when the game is listed there.
