@@ -88,6 +88,9 @@ const defaultMaxReadBytes = positiveEnvNumber("AMP_MAX_READ_BYTES", 1048576, tru
 const defaultHttpTimeoutMs = positiveEnvNumber("AMP_HTTP_TIMEOUT_MS", 30000, true, 4294967295);
 const authRetryBaseMs = positiveEnvNumber("AMP_AUTH_RETRY_BASE_MS", 60000, true, 4294967295);
 const authRetryMaxMs = positiveEnvNumber("AMP_AUTH_RETRY_MAX_MS", 900000, true, 4294967295);
+// How long amp_create_instance waits for a new instance to become visible before
+// applying the configuration AMP drops during provisioning.
+const postCreateConfigTimeoutMs = positiveEnvNumber("AMP_POST_CREATE_CONFIG_TIMEOUT_MS", 60000, true, 4294967295);
 if (authRetryMaxMs < authRetryBaseMs) {
   throw new Error("AMP_AUTH_RETRY_MAX_MS must be greater than or equal to AMP_AUTH_RETRY_BASE_MS.");
 }
@@ -629,7 +632,7 @@ function permissionHint(context: string, message: string) {
     : required.length
       ? `The AMP user's role needs ${required.join(" and ")}.`
       : "The AMP user's role is missing a permission node for this call.";
-  return ` [permissions] ${needs} Only an AMP super admin can grant it (Configuration > Role Management); otherwise do this step from the AMP web UI. To check a node before relying on it, call amp_call with Core/CurrentSessionHasPermission.`;
+  return ` [permissions] ${needs} Only an AMP super admin can grant it (Configuration > Role Management); otherwise do this step from the AMP web UI. Core/CurrentSessionHasPermission answers only for the session it runs on, so a managed-instance call reports false for controller-scoped ADS.* nodes even when the controller session holds them - do not read that as proof the account lacks an ADS permission.`;
 }
 
 function asArray(value: unknown): unknown[] {
@@ -965,6 +968,61 @@ async function resolvePolicyInstance(query?: string, allowCurrent = true) {
   throw new Error(
     `No instance in display group "${policyGroup}" matched "${query}". Allowed instances: ${instances.map((instance) => instanceLabel(instance)).join(", ")}`,
   );
+}
+
+// AMP's CreateInstance takes a FriendlyName and then, on the autoConfigure path,
+// stores the internal instance name instead. Anything else AMP decides for itself
+// during provisioning is silently dropped the same way, so treat creation as
+// "make the instance exist" only and apply configuration once it does.
+async function applyPostCreateConfig(
+  instanceId: string,
+  wanted: { friendlyName: string; description?: string; displayImageSource?: string },
+  timeoutMs: number,
+) {
+  const instance = await waitForInstanceVisible(instanceId, timeoutMs);
+  if (!instance) {
+    return {
+      status: "deferred",
+      detail:
+        "The instance did not become visible before the timeout, so nothing was applied. It is still provisioning; re-apply with ADSModule/UpdateInstanceInfo once amp_instances lists it.",
+    };
+  }
+
+  if ((instance.FriendlyName ?? "") === wanted.friendlyName && !wanted.description && !wanted.displayImageSource) {
+    return { status: "not needed", detail: "AMP kept the requested friendly name." };
+  }
+
+  try {
+    await callAdsMethod("UpdateInstanceInfo", {
+      InstanceId: instanceId,
+      FriendlyName: wanted.friendlyName,
+      Description: wanted.description ?? "",
+      DisplayImageSource: wanted.displayImageSource,
+    });
+    return {
+      status: "applied",
+      detail: `AMP stored the friendly name as "${instance.FriendlyName ?? ""}" during creation; corrected to "${wanted.friendlyName}".`,
+    };
+  } catch (error) {
+    return {
+      status: "failed",
+      detail: `${error instanceof Error ? error.message : String(error)} The instance exists and works; only its display name is wrong.`,
+    };
+  }
+}
+
+async function waitForInstanceVisible(instanceId: string, timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      const found = (await getPolicyInstances()).find((instance) => instanceIdOf(instance) === instanceId);
+      if (found) return found;
+    } catch {
+      // A create can briefly unsettle the controller; keep polling until the deadline.
+    }
+    if (Date.now() >= deadline) return null;
+    await sleep(Math.min(3000, Math.max(0, deadline - Date.now())));
+  }
 }
 
 async function callAdsMethod(methodName: string, params: Record<string, unknown>) {
@@ -2029,7 +2087,7 @@ server.registerTool(
 server.registerTool(
   "amp_create_instance",
   {
-    description: `Create a new AMP instance in the configured policy group (${policyGroup}). Auto-configured by default; leave autoConfigure alone unless you have read its description, because autoConfigure:false produces an instance this MCP can never manage. To place the instance on specific ports, create it auto-configured and then move the ports with ADSModule/SetInstanceNetworkInfo (see amp_call). The new instance is invisible to other tools until the AMP session is refreshed; this tool does that for you.`,
+    description: `Create a new AMP instance in the configured policy group (${policyGroup}). Auto-configured by default; leave autoConfigure alone unless you have read its description, because autoConfigure:false produces an instance this MCP can never manage. To place the instance on specific ports, create it auto-configured and then move the ports with ADSModule/SetInstanceNetworkInfo (see amp_call). The new instance is invisible to other tools until the AMP session is refreshed; this tool does that for you, then waits for the instance and applies the friendly name, because AMP discards it during provisioning. Treat creation as "make the instance exist" only: application settings (world name, MOTD, passwords, slots) do not exist as config nodes until the app is installed, so install with Core/UpdateApplication first, then set them with Core/SetConfig once the instance is running. Check the postCreateConfig field in the result to see what was applied.`,
     annotations: { title: "Create new instance", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     inputSchema: z.object({
       module: z.string().min(1).describe("AMP module name, for example Minecraft, Valheim, or any module reported by amp_supported_apps."),
@@ -2101,6 +2159,7 @@ server.registerTool(
       Group: policyGroup,
     });
 
+    const newInstanceId = String(body.NewInstanceId);
     const result = await callAdsMethod("CreateInstance", body);
 
     // AMP decides which instances a session may see when that session logs in, so
@@ -2128,6 +2187,19 @@ server.registerTool(
       managedInstance = selectedBefore;
     }
 
+    // Only after the refreshed session can see the instance is it worth configuring.
+    const postCreateConfig =
+      args.wait ?? true
+        ? await applyPostCreateConfig(
+            newInstanceId,
+            {
+              friendlyName: args.friendlyName,
+              displayImageSource: args.displayImageSource,
+            },
+            postCreateConfigTimeoutMs,
+          )
+        : { status: "skipped", detail: "wait was false, so the instance was not waited for or configured." };
+
     return textResult({
       policyGroup,
       instanceName: safeName,
@@ -2138,6 +2210,7 @@ server.registerTool(
       autoConfigure,
       result,
       task,
+      postCreateConfig,
       note: `The MCP policy forces this instance into display group "${policyGroup}". The AMP session was refreshed so this instance is visible to the other tools.`,
       ...(taskTimedOut
         ? {
