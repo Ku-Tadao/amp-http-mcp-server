@@ -308,6 +308,17 @@ To check a node before depending on it, rather than discovering the gap halfway 
 amp_call Core/CurrentSessionHasPermission {"PermissionNode": "Settings.GenericModule.Meta.*"}
 ```
 
+**This answers only for the session it runs on.** Run against a managed instance it reports on that
+instance's context, so controller-scoped `ADS.*` nodes come back `false` even when the controller
+session plainly holds them — `ADS.InstanceManagement.CreateInstance` reads `false` from a managed
+session on an account that creates instances successfully. Do not take a `false` there as proof the
+account lacks an ADS permission; the only reliable evidence for those is whether the controller call
+itself succeeds.
+
+The role checkboxes in AMP's web panel are also not a reliable read of effective permissions: a role
+can show a node as unchecked while the account still performs the action through another role or an
+inherited grant. Trust the permission list returned by `Core/Login`, or observed behaviour.
+
 Permission denials raised through `amp_call` carry a `[permissions]` hint naming the node to grant.
 Granting is a super-admin action in AMP's Configuration > Role Management.
 
@@ -330,6 +341,26 @@ amp_call ADSModule/SetInstanceNetworkInfo {"InstanceId": "<guid>", "PortMappings
 The `PortMappings` keys are the `ProvisionNodeName` values from `GetInstanceNetworkInfo`. Note that
 `ADSModule/ApplyInstanceConfiguration` accepts port arguments and silently does not apply them —
 use `SetInstanceNetworkInfo`.
+
+### Configure after creation, not during it
+
+AMP decides a lot for itself while provisioning and quietly discards the rest. `FriendlyName` is the
+clearest case: pass one to `CreateInstance` on the autoConfigure path and AMP stores the internal
+instance name instead, with no error. `amp_create_instance` now waits for the new instance to become
+visible and re-applies the friendly name through `UpdateInstanceInfo`, reporting the outcome in the
+result's `postCreateConfig` field.
+
+Treat the same rule as general. Creation makes the instance exist; everything else belongs after it:
+
+1. Create (auto-configured).
+2. Move ports with `SetInstanceNetworkInfo`.
+3. Install the app with `Core/UpdateApplication`.
+4. Only now set application settings with `Core/SetConfig`.
+
+Step 4 cannot be pulled earlier. An app's settings nodes come from its config manifest, which does
+not exist until the app is installed — on a fresh Necesse instance `Meta.GenericModule.world` returns
+`No such node` until `UpdateApplication` has run. `provisionSettings` at create time is not a
+substitute; it feeds AMP's provisioning template, not the app's own configuration.
 
 ## Stale Sessions
 
