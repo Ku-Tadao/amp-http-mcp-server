@@ -582,6 +582,14 @@ function readPermissions(loginResult: unknown) {
   return asArray(raw).filter((entry): entry is string => typeof entry === "string");
 }
 
+// Bounds what amp_grant_app_settings will hand out. An account allowed to edit its
+// own role can otherwise escalate to anything, so only an app's own settings pass:
+// Settings.Core.* is AMP's security, webserver and login configuration, and every
+// non-Settings family (Core.RoleManagement, ADS.*, Instances.*) is refused outright.
+function isGrantableAppSettingNode(node: string) {
+  return /^Settings\./i.test(node) && !/^Settings\.Core\./i.test(node);
+}
+
 function hasPermission(node: string) {
   return grantedPermissions.some((granted) => granted === node || (granted.endsWith(".*") && node.startsWith(granted.slice(0, -1))));
 }
@@ -1630,6 +1638,65 @@ server.registerTool(
 );
 
 server.registerTool(
+  "amp_grant_app_settings",
+  {
+    description:
+      "Grant (or revoke) an AMP role's permission to change an instance's application settings, so a new game server can be configured without a trip to the web UI. Game-settings nodes such as Settings.Meta.GenericModule exist only inside the instance that runs the app, never on the ADS controller, which is why they cannot be ticked from the controller's Role Management page - this routes the call to the instance instead. Requires the AMP account to hold Core.RoleManagement.ViewRoles and Core.RoleManagement.EditRolePermissions, which a super admin grants once from the controller. Only Settings.* nodes are accepted, and Settings.Core.* is refused because that is AMP's own security, webserver and login configuration rather than anything to do with a game.",
+    annotations: { title: "Grant app settings permission", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    inputSchema: z.object({
+      role: z.string().min(1).describe("Role name, for example the role the MCP account belongs to. Case-insensitive."),
+      nodes: z.array(z.string().min(1)).min(1).describe("Settings.* permission nodes to change, for example [\"Settings.Meta.GenericModule\"]. A parent node covers its whole group."),
+      instance: z.string().optional().describe("Instance whose permission tree defines these nodes. Omit to use the selected instance."),
+      enabled: z.boolean().optional().describe("True to grant (default), false to revoke."),
+    }),
+  },
+  async ({ role, nodes, instance, enabled }) => {
+    // The node allowlist is the point of this tool rather than an afterthought: an
+    // account that can edit its own role can otherwise grant itself anything,
+    // including Core.RoleManagement and ADS.*, which would quietly turn a
+    // least-privilege automation account into a super admin.
+    const refused = nodes.filter((node) => !isGrantableAppSettingNode(node));
+    if (refused.length) {
+      throw new Error(
+        `Refusing to change ${refused.join(", ")}. This tool only grants application settings: nodes must start with "Settings." and must not be under "Settings.Core." (AMP's own security, webserver and login settings). Change anything else from the AMP web UI deliberately.`,
+      );
+    }
+
+    const target = await resolvePolicyInstance(instance);
+    if (!target) throw new Error("No instance is selected. Call amp_use_instance first, or pass instance.");
+
+    const roleIds = asRecord(await callManagedMethod(target, "Core", "GetRoleIds"));
+    const match = Object.entries(roleIds ?? {}).find(([, name]) => String(name).toLowerCase() === role.toLowerCase());
+    if (!match) {
+      throw new Error(`No AMP role named "${role}". Available roles: ${Object.values(roleIds ?? {}).join(", ") || "none visible"}.`);
+    }
+    const [roleId, roleName] = match;
+
+    const results: Record<string, string> = {};
+    for (const node of nodes) {
+      try {
+        await callManagedMethod(target, "Core", "SetAMPRolePermission", {
+          RoleId: roleId,
+          PermissionNode: node,
+          Enabled: enabled ?? true,
+        });
+        results[node] = enabled === false ? "revoked" : "granted";
+      } catch (error) {
+        results[node] = `failed: ${error instanceof Error ? error.message : String(error)}`;
+      }
+    }
+
+    return textResult({
+      instance: summarizeInstance(target),
+      role: roleName,
+      roleId,
+      results,
+      note: "Permissions are read at login, so call amp_clear_session before relying on a change made here.",
+    });
+  },
+);
+
+server.registerTool(
   "amp_permissions",
   {
     description:
@@ -2487,6 +2554,15 @@ function checkDiagnosticMessages() {
   }
   assertSetterApplied("Core", "SetConfigs", true);
   assertSetterApplied("Core", "GetConfigs", false);
+
+  // An account that can edit its own role could otherwise grant itself anything, so
+  // the allowlist is load-bearing rather than cosmetic. Pin what it must refuse.
+  for (const node of ["Core.RoleManagement.EditRolePermissions", "ADS.InstanceManagement.DeleteInstances", "Instances.abc.Manage", "Settings.Core.Security.TwoFactorMode", "settings.core.login.UseOIDC", ""]) {
+    if (isGrantableAppSettingNode(node)) throw new Error(`amp_grant_app_settings would accept "${node}", which is not an application setting.`);
+  }
+  for (const node of ["Settings.Meta.GenericModule", "Settings.MinecraftModule.Game.Difficulty", "settings.meta.genericmodule.world"]) {
+    if (!isGrantableAppSettingNode(node)) throw new Error(`amp_grant_app_settings would refuse "${node}", which is an application setting.`);
+  }
 
   if (isAuthenticatedSpec({ Core: { Login: {} } } as unknown as AmpSpec)) {
     throw new Error("The pre-login stub spec is being treated as authenticated and would be cached.");
