@@ -277,6 +277,76 @@ When the MCP policy is enabled:
 
 This policy is a guardrail in this MCP server. It is not a replacement for AMP permissions. You should still use least-privilege AMP roles because anyone with direct API access can bypass this wrapper.
 
+## What The Automation Account Can And Cannot Do
+
+Least privilege has a sharp edge worth knowing before an agent hits it mid-task: the grants that
+let the account run a server are separate from the grants that let it configure one. A typical
+non-super-admin automation role can create instances, move their ports, install and update the
+game, start and stop it, read the console and use the file manager — and still be unable to change
+a single game setting.
+
+| Action | Permission node | Usually granted? |
+| --- | --- | --- |
+| Create an instance | `ADS.InstanceManagement.CreateInstance` | yes |
+| Change instance ports (`ADSModule/SetInstanceNetworkInfo`) | `ADS.InstanceManagement.Reconfigure` | yes |
+| Install/update the game (`Core/UpdateApplication`) | `Core.AppManagement.UpdateApplication` | yes |
+| Start/stop the app | `Core.AppManagement.*` | yes |
+| **Write instance settings (`Core/SetConfig`, `Core/SetConfigs`)** | **`Settings.*`** | **often not** |
+| Delete an instance | `ADS.InstanceManagement.DeleteInstances` | rarely |
+| Read user/role info | `Core.UserManagement.ViewUserInfo` | rarely |
+
+The `Settings.*` gap is the one that bites. It means a freshly created server runs on its template
+defaults and the values an operator actually cares about — server password, admin/owner name, world
+name, MOTD, slot count — have to be set from the AMP web UI by a super admin. `Core/SetConfigs`
+signals this badly: it returns a bare `false` rather than an error, so this server converts that
+into a real failure that names the likely cause and tells you to retry with `Core/SetConfig`, which
+does report AMP's reason.
+
+To check a node before depending on it, rather than discovering the gap halfway through:
+
+```bash
+amp_call Core/CurrentSessionHasPermission {"PermissionNode": "Settings.GenericModule.Meta.*"}
+```
+
+Permission denials raised through `amp_call` carry a `[permissions]` hint naming the node to grant.
+Granting is a super-admin action in AMP's Configuration > Role Management.
+
+## Creating Instances
+
+Always create with `autoConfigure: true` (the default). AMP builds an `autoConfigure: false`
+instance in standalone management mode with its own local admin account, which the controller
+credentials cannot log into — every managed call then fails with `Core/Login returned no session
+ID`, and `ADSModule/ReactivateInstance` does not repair it. The instance has to be deleted from the
+web UI.
+
+Wanting specific ports is not a reason to pass `false`. Create the instance auto-configured, then
+move its ports:
+
+```bash
+amp_call ADSModule/GetInstanceNetworkInfo {"InstanceName": "Necesse03"}
+amp_call ADSModule/SetInstanceNetworkInfo {"InstanceId": "<guid>", "PortMappings": {"GenericModule.App.Ports.$GamePort": 50004, "FileManagerPlugin.SFTP.SFTPPortNumber": 50005}, "mustStop": true}
+```
+
+The `PortMappings` keys are the `ProvisionNodeName` values from `GetInstanceNetworkInfo`. Note that
+`ADSModule/ApplyInstanceConfiguration` accepts port arguments and silently does not apply them —
+use `SetInstanceNetworkInfo`.
+
+## Stale Sessions
+
+AMP decides which instances a session can see, and what its API spec contains, when that session
+logs in. A session opened before something changed keeps reporting the old world. This surfaces as
+errors that have nothing to do with what you just did:
+
+- `The requested instance is not available at this time`
+- `You do not have permission ... requires the Session.Exists permission`
+- `Unknown AMP method "Core/GetStatus"` for a method that plainly exists
+- an instance missing from `amp_status` that `ADSModule/GetLocalInstances` shows
+- a login cooldown after a single transient error
+
+`amp_clear_session` fixes all of them. It drops the session, cached specs, selection and cooldowns
+while keeping credentials, so the next call logs in again. `amp_create_instance` now does this
+automatically, since the session that created an instance cannot see it.
+
 ## File Manager Warning
 
 AMP's `FileManager.FileManager.*` permissions are broad permission nodes. Depending on how your AMP deployment is structured, granting file-manager permissions may allow browsing files in the current AMP instance context.
