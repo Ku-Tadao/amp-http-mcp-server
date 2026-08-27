@@ -41,6 +41,11 @@ Use `amp_call` only when no friendly tool covers the operation. For raw calls, u
 }
 ```
 
+AMP's network methods use inconsistent identifiers: `ADSModule/GetInstanceNetworkInfo` takes
+`InstanceName`, while `ADSModule/SetInstanceNetworkInfo` requires the instance GUID as `InstanceId`.
+With `mustStop: true`, wait for `GetInstanceStatuses` to report the instance stopped before calling
+`amp_start_instance`; otherwise its pre-stop status can still look running.
+
 ## Safety
 
 - Keep all operations inside the configured MCP policy group.

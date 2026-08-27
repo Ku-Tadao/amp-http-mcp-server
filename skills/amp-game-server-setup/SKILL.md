@@ -1,6 +1,10 @@
 ---
 name: amp-game-server-setup
-description: Create and configure game servers on an AMP (CubeCoders) panel through the AMP MCP tools, interviewing the user for the decisions that actually matter and respecting the order AMP requires. Use this whenever someone wants a game server created, deployed, provisioned or "spun up" on AMP - Minecraft, Valheim, Necesse, Palworld, Rust, Terraria, ARK, any of the 240-odd apps it supports - and equally when they want an existing server reconfigured: difficulty, MOTD, slots, whitelist, passwords, mods. Trigger on "make me a Minecraft server", "set up another Necesse server", "add a modded server", "change my server's difficulty", "why won't my server let me set X", even when AMP is never named, as long as AMP MCP tools are available.
+description: >-
+  Create or reconfigure game servers on CubeCoders AMP through MCP, including guided setup,
+  instance creation, ports, installation, and settings such as difficulty, MOTD, slots, access,
+  and mods. Use when the user asks to create, deploy, or change any AMP-managed game server,
+  even if AMP is not named and its MCP tools are available.
 ---
 
 # Game servers on AMP
@@ -21,6 +25,10 @@ Four things, and only these, before anything exists:
 - **A name.** Theirs, or derived from the game and a number.
 - **Ports.** See below — usually you decide these, not them.
 - **Depth.** Basic or advanced, which only changes how much of phase 2 you ask about.
+
+Use the client's native structured-question UI for bounded choices whenever it is available; do not
+send a prose questionnaire. Batch related decisions, provide mutually exclusive options, and mark a
+recommended default. The UI's free-form option covers names, passwords, and unusual answers.
 
 Do not ask about difficulty, MOTD, passwords or mods yet. You cannot apply the answers, and asking
 for values you will have to ask about again later is worse than waiting.
@@ -44,11 +52,16 @@ Order matters; each step is what makes the next possible.
    it — it has to be deleted. Wanting specific ports is not a reason; ports move in step 2.
    Creation is slow, and a `taskTimedOut` in the result means it is still provisioning, **not** that
    it failed. Never create it a second time.
-2. **Move the ports.** `ADSModule/GetInstanceNetworkInfo` gives the `ProvisionNodeName` keys; feed
-   them to `ADSModule/SetInstanceNetworkInfo` with `mustStop: true`.
-   `ApplyInstanceConfiguration` accepts port arguments and silently ignores them.
+2. **Move the ports.** `ADSModule/GetInstanceNetworkInfo` takes `InstanceName` and gives the
+   `ProvisionNodeName` keys. `ADSModule/SetInstanceNetworkInfo` instead requires the instance's GUID
+   as `InstanceId` — take it from `amp_create_instance` or `amp_instances`, never pass the instance
+   name — plus those keys and `mustStop: true`. `ApplyInstanceConfiguration` accepts port arguments
+   and silently ignores them. The stop is asynchronous and leaves the instance stopped: wait for
+   `ADSModule/GetInstanceStatuses` to report `Running: false`, then `amp_start_instance` and wait for
+   `Running: true`. Calling start before the stop settles can incorrectly return `alreadyRunning`.
 3. **Install.** `amp_use_instance`, then `Core/UpdateApplication`. Minutes, not seconds — watch
-   `Core/GetTasks` or `amp_console_read`.
+   `Core/GetTasks` or `amp_console_read`. Poll those tools directly; do not launch background sleep
+   or timer commands that can outlive the completed setup.
 
 Now the server has settings.
 
