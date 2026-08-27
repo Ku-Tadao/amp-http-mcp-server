@@ -215,8 +215,32 @@ async function getManagedSpec(instance = managedInstance) {
   const cached = managedSpecs.get(id);
   if (cached) return cached;
   const spec = (await ampRequest("Core", "GetAPISpec", {}, instance)) as AmpSpec;
-  managedSpecs.set(id, spec);
+  // An unauthenticated instance returns a stub Core module holding only the login
+  // methods. Caching that stub makes every later call fail with "Unknown AMP
+  // method", long after the session recovered, so only cache a real spec.
+  if (isAuthenticatedSpec(spec)) managedSpecs.set(id, spec);
   return spec;
+}
+
+// Core/GetStatus is present for any authenticated session and absent from the
+// pre-login stub, which advertises only Login/GetAPISpec and friends.
+function isAuthenticatedSpec(spec: AmpSpec | null | undefined) {
+  return Boolean(spec?.Core?.GetStatus);
+}
+
+// AMP's bulk setters (Core/SetConfigs and friends) answer a refused write with a
+// bare `false` and no reason, which reads as success to anything that only checks
+// for an error object. Turn it into the failure it is, and point at the singular
+// form, which does return AMP's actual reason.
+function assertSetterApplied(moduleName: string, methodName: string, result: unknown) {
+  if (result !== false || !/^Set[A-Z]/.test(methodName)) return;
+  const singular = methodName.endsWith("s") ? methodName.slice(0, -1) : "";
+  const retry = singular
+    ? ` Retry one value at a time with ${moduleName}/${singular} to get AMP's reason.`
+    : "";
+  throw new Error(
+    `AMP rejected ${moduleName}/${methodName}: it returned false and applied nothing, without saying why.${retry} The usual cause is that this AMP user's role lacks the Settings.* permission for these nodes; only a super admin can grant it, or make the change from the AMP web UI.`,
+  );
 }
 
 async function resolveMethodMeta(moduleName: string, methodName: string, instance: AmpInstance | null) {
@@ -586,8 +610,26 @@ function actionResultValue(value: unknown) {
 function assertAmpAccepted(context: string, value: unknown) {
   if (isAmpError(value) || isActionFailure(value)) {
     const message = getAmpErrorMessage(value) || actionMessage(value) || "AMP returned an error.";
-    throw new Error(`AMP rejected ${context}: ${message}`);
+    throw new Error(`AMP rejected ${context}: ${message}${permissionHint(context, message)}`);
   }
+}
+
+// AMP's permission denials are inconsistent: method-level ones name the node they
+// want, but setting-level ones ("does not have permission to modify setting 'X'")
+// name nothing an operator can act on. Say what to grant, in both cases.
+function permissionHint(context: string, message: string) {
+  if (!/\bpermission\b/i.test(message)) return "";
+
+  const [moduleName, methodName] = context.split("/");
+  const settingNode = /modify setting '([^']+)'/i.exec(message)?.[1];
+  const required = findMethodMeta(moduleName ?? "", methodName ?? "")?.RequiredPermissions ?? [];
+
+  const needs = settingNode
+    ? `The AMP user's role needs the Settings.* node covering "${settingNode}" (writing instance settings is a separate grant from starting/updating the app).`
+    : required.length
+      ? `The AMP user's role needs ${required.join(" and ")}.`
+      : "The AMP user's role is missing a permission node for this call.";
+  return ` [permissions] ${needs} Only an AMP super admin can grant it (Configuration > Role Management); otherwise do this step from the AMP web UI. To check a node before relying on it, call amp_call with Core/CurrentSessionHasPermission.`;
 }
 
 function asArray(value: unknown): unknown[] {
@@ -1480,7 +1522,8 @@ server.registerTool(
 server.registerTool(
   "amp_clear_session",
   {
-    description: "Forget the stored AMP session ID.",
+    description:
+      "Forget the stored AMP session ID and every cached spec, selection and login cooldown. Credentials are kept, so the next call simply logs in again. This is the first thing to try when a managed call fails for a reason that does not fit what you just did - \"The requested instance is not available at this time\", \"requires the Session.Exists permission\", \"Unknown AMP method\" for a method that plainly exists, an instance that amp_status will not show, or a login cooldown after a one-off error. AMP fixes a session's visible instances and its API spec at login time, so a session opened before something changed keeps reporting the old world until it is replaced.",
     annotations: { title: "Clear cached AMP session", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     inputSchema: z.object({}),
   },
@@ -1986,7 +2029,7 @@ server.registerTool(
 server.registerTool(
   "amp_create_instance",
   {
-    description: `Create a new AMP instance in the configured policy group (${policyGroup}). Auto-configured by default.`,
+    description: `Create a new AMP instance in the configured policy group (${policyGroup}). Auto-configured by default; leave autoConfigure alone unless you have read its description, because autoConfigure:false produces an instance this MCP can never manage. To place the instance on specific ports, create it auto-configured and then move the ports with ADSModule/SetInstanceNetworkInfo (see amp_call). The new instance is invisible to other tools until the AMP session is refreshed; this tool does that for you.`,
     annotations: { title: "Create new instance", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     inputSchema: z.object({
       module: z.string().min(1).describe("AMP module name, for example Minecraft, Valheim, or any module reported by amp_supported_apps."),
@@ -1995,7 +2038,12 @@ server.registerTool(
       instanceName: z.string().optional().describe("Internal instance name. Defaults to a safe name generated from friendlyName."),
       targetADSInstance: z.string().optional().describe("Target ADS instance GUID. Auto-detected when possible."),
       newInstanceId: z.string().optional().describe("New instance GUID. Generated when omitted."),
-      autoConfigure: z.boolean().optional().describe("Let AMP choose ports/settings. Defaults to true."),
+      autoConfigure: z
+        .boolean()
+        .optional()
+        .describe(
+          "Let AMP choose ports/settings. Defaults to true, and should stay true. AMP creates an autoConfigure:false instance in standalone management mode (ManagementMode 0) with its own local admin account, so the controller credentials this MCP holds cannot log into it: every managed call fails with \"Core/Login returned no session ID\" and the instance can never be driven through this MCP. ADSModule/ReactivateInstance does not repair it. Setting specific ports is NOT a reason to pass false - create auto-configured, then move the ports with ADSModule/SetInstanceNetworkInfo. Pass false only to deliberately create a hands-off instance you will manage from the AMP web UI.",
+        ),
       ipBinding: z.string().optional().describe("Used when autoConfigure is false. Defaults to 0.0.0.0."),
       portNumber: z.number().int().nonnegative().optional().describe("Used when autoConfigure is false."),
       adminUsername: z.string().optional().describe("Module admin username if the app requires one. Defaults to admin."),
@@ -2055,6 +2103,16 @@ server.registerTool(
 
     const result = await callAdsMethod("CreateInstance", body);
     const task = args.wait ?? true ? await waitForControllerTask(result, args.waitTimeoutMs) : null;
+
+    // AMP decides which instances a session may see when that session logs in, so
+    // the session that just created this instance still cannot see it. Drop the
+    // session (keeping the credentials) so the next call re-logs in and finds it.
+    // Creating an instance is not a reason to lose the caller's current selection,
+    // so put it back; its managed session is re-established on the next call.
+    const selectedBefore = managedInstance;
+    resetConnectionState();
+    managedInstance = selectedBefore;
+
     return textResult({
       policyGroup,
       instanceName: safeName,
@@ -2062,9 +2120,16 @@ server.registerTool(
       module: moduleName,
       applicationId: args.applicationId ?? null,
       targetADSInstance,
+      autoConfigure,
       result,
       task,
-      note: `The MCP policy forces this instance into display group "${policyGroup}".`,
+      note: `The MCP policy forces this instance into display group "${policyGroup}". The AMP session was refreshed so this instance is visible to the other tools.`,
+      ...(autoConfigure
+        ? {}
+        : {
+            warning:
+              "Created with autoConfigure:false, so AMP made this a standalone (ManagementMode 0) instance with its own local admin account. This MCP cannot log into it and cannot manage it. Delete it from the AMP web UI and re-create with autoConfigure:true if that was not intended.",
+          }),
     });
   },
 );
@@ -2113,6 +2178,7 @@ server.registerTool(
     const result = await ampRequest(moduleName, methodName, policyBody, routeInstance);
     await updateManagedInstance(moduleName, methodName, policyBody, result);
     assertAmpAccepted(`${moduleName}/${methodName}`, result);
+    assertSetterApplied(moduleName, methodName, result);
     return textResult(result);
   },
 );
@@ -2213,9 +2279,43 @@ async function checkPolicyGuards() {
   }
 }
 
+// The three failure modes below all used to surface as something misleading, so
+// assert each one still explains itself.
+function checkDiagnosticMessages() {
+  const settingDenial = permissionHint(
+    "Core/SetConfig",
+    "The current user does not have permission to modify setting 'Meta.GenericModule.world'.",
+  );
+  if (!settingDenial.includes("Meta.GenericModule.world") || !settingDenial.includes("super admin")) {
+    throw new Error("Setting-level permission denials no longer name the setting and the fix.");
+  }
+  if (permissionHint("Core/GetStatus", "The specified instance is not running") !== "") {
+    throw new Error("permissionHint fires on errors that are not permission denials.");
+  }
+
+  try {
+    assertSetterApplied("Core", "SetConfigs", false);
+    throw new Error("A bare false from a bulk setter was treated as success.");
+  } catch (error) {
+    if (!(error instanceof Error) || !error.message.includes("Core/SetConfig ")) {
+      throw new Error("SetConfigs failure no longer points at the singular SetConfig.");
+    }
+  }
+  assertSetterApplied("Core", "SetConfigs", true);
+  assertSetterApplied("Core", "GetConfigs", false);
+
+  if (isAuthenticatedSpec({ Core: { Login: {} } } as unknown as AmpSpec)) {
+    throw new Error("The pre-login stub spec is being treated as authenticated and would be cached.");
+  }
+  if (!isAuthenticatedSpec({ Core: { GetStatus: {} } } as unknown as AmpSpec)) {
+    throw new Error("A real authenticated spec is no longer cacheable.");
+  }
+}
+
 async function selfTest() {
   checkPathHandling();
   checkAuthBackoffAndTaskIds();
+  checkDiagnosticMessages();
   await checkPolicyGuards();
   const modules = Object.keys(cachedSpec);
   const methods = modules.reduce((sum, moduleName) => sum + Object.keys(cachedSpec[moduleName] ?? {}).length, 0);
