@@ -90,9 +90,10 @@ const defaultMaxReadBytes = positiveEnvNumber("AMP_MAX_READ_BYTES", 1048576, tru
 const defaultHttpTimeoutMs = positiveEnvNumber("AMP_HTTP_TIMEOUT_MS", 30000, true, 4294967295);
 const authRetryBaseMs = positiveEnvNumber("AMP_AUTH_RETRY_BASE_MS", 60000, true, 4294967295);
 const authRetryMaxMs = positiveEnvNumber("AMP_AUTH_RETRY_MAX_MS", 900000, true, 4294967295);
-// How long amp_create_instance waits for a new instance to become visible before
-// applying the configuration AMP drops during provisioning.
-const postCreateConfigTimeoutMs = positiveEnvNumber("AMP_POST_CREATE_CONFIG_TIMEOUT_MS", 60000, true, 4294967295);
+// Safety net for amp_create_instance's wait for a new instance to report Running.
+// Provisioning is watched via its actual status, so this only bounds a stuck create.
+const postCreateConfigTimeoutMs = positiveEnvNumber("AMP_POST_CREATE_CONFIG_TIMEOUT_MS", 300000, true, 4294967295);
+const instanceStatusPollMs = positiveEnvNumber("AMP_INSTANCE_STATUS_POLL_MS", 5000, true, 600000);
 if (authRetryMaxMs < authRetryBaseMs) {
   throw new Error("AMP_AUTH_RETRY_MAX_MS must be greater than or equal to AMP_AUTH_RETRY_BASE_MS.");
 }
@@ -997,12 +998,22 @@ async function applyPostCreateConfig(
   wanted: { friendlyName: string; description?: string; displayImageSource?: string },
   timeoutMs: number,
 ) {
-  const instance = await waitForInstanceVisible(instanceId, timeoutMs);
+  const { running, lastSeen } = await waitForInstanceRunning(instanceId, timeoutMs);
+  if (!running) {
+    return {
+      status: "deferred",
+      detail: lastSeen
+        ? "The instance exists but has not reported Running yet, so nothing was applied. Re-apply with ADSModule/UpdateInstanceInfo once amp_instances lists it."
+        : "The instance has not appeared in ADSModule/GetInstanceStatuses yet, so nothing was applied. It is still provisioning; check amp_instances shortly.",
+    };
+  }
+
+  const instance = await revealNewInstance(instanceId);
   if (!instance) {
     return {
       status: "deferred",
       detail:
-        "The instance did not become visible before the timeout, so nothing was applied. It is still provisioning; re-apply with ADSModule/UpdateInstanceInfo once amp_instances lists it.",
+        "The instance is running but did not appear in the policy group after a fresh login, so nothing was applied. Check that it landed in the expected display group.",
     };
   }
 
@@ -1029,18 +1040,39 @@ async function applyPostCreateConfig(
   }
 }
 
-async function waitForInstanceVisible(instanceId: string, timeoutMs: number) {
+// Wait for the instance itself to report a state, rather than guessing at a
+// duration. ADSModule/GetInstanceStatuses is the endpoint to ask: unlike
+// GetInstances it is not filtered by the session's visible-instance set, so it
+// reports the new instance as soon as AMP creates it, and it carries Running so
+// "provisioned" is an observed fact instead of an elapsed-time bet.
+async function waitForInstanceRunning(instanceId: string, timeoutMs: number) {
   const deadline = Date.now() + timeoutMs;
+  let lastSeen: AmpRecord | null = null;
   for (;;) {
     try {
-      const found = (await getPolicyInstances()).find((instance) => instanceIdOf(instance) === instanceId);
-      if (found) return found;
+      lastSeen =
+        asArray(await ampRequest("ADSModule", "GetInstanceStatuses"))
+          .map(asRecord)
+          .find((entry) => String(entry?.InstanceID ?? entry?.InstanceId ?? "").toLowerCase() === instanceId.toLowerCase()) ?? null;
+      if (lastSeen?.Running === true) return { running: true as const, lastSeen };
     } catch {
-      // A create can briefly unsettle the controller; keep polling until the deadline.
+      // A create briefly unsettles the controller; keep polling until the deadline.
     }
-    if (Date.now() >= deadline) return null;
-    await sleep(Math.min(3000, Math.max(0, deadline - Date.now())));
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) return { running: false as const, lastSeen };
+    await sleep(Math.min(instanceStatusPollMs, remainingMs));
   }
+}
+
+// Once the instance is running it exists as far as AMP is concerned, but the
+// current session still cannot see it: a session's visible instances are fixed at
+// login. One re-login now makes it visible, and unlike polling GetInstances it is
+// a single deterministic step rather than a retry loop.
+async function revealNewInstance(instanceId: string) {
+  const selectedBefore = managedInstance;
+  resetConnectionState();
+  managedInstance = selectedBefore;
+  return (await getPolicyInstances()).find((instance) => instanceIdOf(instance) === instanceId) ?? null;
 }
 
 async function callAdsMethod(methodName: string, params: Record<string, unknown>) {
@@ -2134,7 +2166,7 @@ server.registerTool(
 server.registerTool(
   "amp_create_instance",
   {
-    description: `Create a new AMP instance in the configured policy group (${policyGroup}). Auto-configured by default; leave autoConfigure alone unless you have read its description, because autoConfigure:false produces an instance this MCP can never manage. To place the instance on specific ports, create it auto-configured and then move the ports with ADSModule/SetInstanceNetworkInfo (see amp_call). The new instance is invisible to other tools until the AMP session is refreshed; this tool does that for you, then waits for the instance and applies the friendly name, because AMP discards it during provisioning. Treat creation as "make the instance exist" only: application settings (world name, MOTD, passwords, slots) do not exist as config nodes until the app is installed, so install with Core/UpdateApplication first, then set them with Core/SetConfig once the instance is running. Check the postCreateConfig field in the result to see what was applied.`,
+    description: `Create a new AMP instance in the configured policy group (${policyGroup}). Auto-configured by default; leave autoConfigure alone unless you have read its description, because autoConfigure:false produces an instance this MCP can never manage. To place the instance on specific ports, create it auto-configured and then move the ports with ADSModule/SetInstanceNetworkInfo (see amp_call). The new instance is invisible to other tools until the AMP session is refreshed; this tool polls the new instance's own status until it reports Running, then re-logs in to reveal it and applies the friendly name, because AMP discards it during provisioning. Treat creation as "make the instance exist" only: application settings (world name, MOTD, passwords, slots) do not exist as config nodes until the app is installed, so install with Core/UpdateApplication first, then set them with Core/SetConfig once the instance is running. Check the postCreateConfig field in the result to see what was applied.`,
     annotations: { title: "Create new instance", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     inputSchema: z.object({
       module: z.string().min(1).describe("AMP module name, for example Minecraft, Valheim, or any module reported by amp_supported_apps."),
