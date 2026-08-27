@@ -56,6 +56,8 @@ let loginCredentials = {
   token: process.env.AMP_TOKEN ?? "",
 };
 let cachedSpec: AmpSpec = fallbackSpec as AmpSpec;
+// Effective permissions for the logged-in account, as returned by Core/Login.
+let grantedPermissions: string[] = [];
 let policyEnabled = process.env.AMP_POLICY_ENABLED !== "false";
 let policyGroup = process.env.AMP_POLICY_GROUP ?? "AI";
 const policyLocked = process.env.AMP_POLICY_LOCKED !== "false";
@@ -197,6 +199,7 @@ const managedSpecs = new Map<string, AmpSpec>();
 function resetConnectionState(clearControllerSession = true) {
   if (clearControllerSession) sessionId = "";
   cachedSpec = fallbackSpec as AmpSpec;
+  grantedPermissions = [];
   controllerLoginPromise = null;
   clearAuthRetry(controllerAuthRetry);
   managedInstance = null;
@@ -563,8 +566,23 @@ async function loginAndRefresh(params: { username: string; password: string; tok
   }
   if (!sessionId) throw new AmpAuthenticationRejectedError("AMP accepted Core/Login but returned no session ID.");
   loginCredentials = { username: params.username, password: params.password, token: params.token };
+  grantedPermissions = readPermissions(result);
   cachedSpec = await refreshControllerSpec();
   return result;
+}
+
+// Core/Login hands back the account's effective permissions, resolved across every
+// role it belongs to. That is the only trustworthy answer: AMP's role editor shows
+// per-role checkboxes that do not reflect the union, and Core/CurrentSessionHasPermission
+// answers for one session's scope rather than the account's.
+function readPermissions(loginResult: unknown) {
+  const record = asRecord(loginResult);
+  const raw = record?.permissions ?? record?.Permissions;
+  return asArray(raw).filter((entry): entry is string => typeof entry === "string");
+}
+
+function hasPermission(node: string) {
+  return grantedPermissions.some((granted) => granted === node || (granted.endsWith(".*") && node.startsWith(granted.slice(0, -1))));
 }
 
 function isAmpError(value: unknown) {
@@ -632,7 +650,7 @@ function permissionHint(context: string, message: string) {
     : required.length
       ? `The AMP user's role needs ${required.join(" and ")}.`
       : "The AMP user's role is missing a permission node for this call.";
-  return ` [permissions] ${needs} Only an AMP super admin can grant it (Configuration > Role Management); otherwise do this step from the AMP web UI. Core/CurrentSessionHasPermission answers only for the session it runs on, so a managed-instance call reports false for controller-scoped ADS.* nodes even when the controller session holds them - do not read that as proof the account lacks an ADS permission.`;
+  return ` [permissions] ${needs} Only an AMP super admin can grant it (Configuration > Role Management); otherwise do this step from the AMP web UI. Call amp_permissions for the account's effective grants; do not use Core/CurrentSessionHasPermission for this, because it answers only for the session it runs on and reports false for controller-scoped ADS.* nodes even when the account holds them.`;
 }
 
 function asArray(value: unknown): unknown[] {
@@ -1574,6 +1592,35 @@ server.registerTool(
       rememberMe: process.env.AMP_REMEMBER_ME === "true",
     });
     return textResult({ baseUrl, hasSession: sessionId.length > 0, loginResult: result });
+  },
+);
+
+server.registerTool(
+  "amp_permissions",
+  {
+    description:
+      "Report what this AMP account is actually allowed to do, from the effective permission list Core/Login returns. Use it before planning work that depends on a permission, and after any permission denial. This is the authoritative answer: it is resolved across every role the account belongs to, unlike AMP's per-role checkboxes in the web panel, and unlike Core/CurrentSessionHasPermission which answers only for the scope of the session it runs on (controller-scoped ADS.* nodes read false from a managed-instance session even when the account holds them). Pass nodes to test specific permissions.",
+    annotations: { title: "Show effective AMP permissions", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    inputSchema: z.object({
+      nodes: z.array(z.string()).optional().describe("Permission nodes to test, for example Settings.GenericModule.Meta.* or ADS.InstanceManagement.DeleteInstances."),
+      includeInstanceGrants: z.boolean().optional().describe("Include the per-instance Instances.<id>.* grants, which are numerous. Defaults to false."),
+    }),
+  },
+  async ({ nodes, includeInstanceGrants }) => {
+    await ensureSession("Core", "GetAPISpec");
+    const instanceGrants = grantedPermissions.filter((node) => node.startsWith("Instances."));
+    const globalGrants = grantedPermissions.filter((node) => !node.startsWith("Instances."));
+
+    return textResult({
+      username: loginCredentials.username || null,
+      canWriteInstanceSettings: hasPermission("Settings.GenericModule.Meta"),
+      granted: globalGrants,
+      instanceGrantCount: instanceGrants.length,
+      ...(includeInstanceGrants ? { instanceGrants } : {}),
+      ...(nodes?.length ? { checked: Object.fromEntries(nodes.map((node) => [node, hasPermission(node)])) } : {}),
+      note:
+        "A node absent from this list is not granted. Settings.* is commonly missing, which blocks Core/SetConfig while leaving start/stop/update working; only an AMP super admin can grant it.",
+    });
   },
 );
 

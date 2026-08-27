@@ -285,15 +285,16 @@ non-super-admin automation role can create instances, move their ports, install 
 game, start and stop it, read the console and use the file manager — and still be unable to change
 a single game setting.
 
-| Action | Permission node | Usually granted? |
+| Action | Permission node | Granted on the reference deployment |
 | --- | --- | --- |
 | Create an instance | `ADS.InstanceManagement.CreateInstance` | yes |
 | Change instance ports (`ADSModule/SetInstanceNetworkInfo`) | `ADS.InstanceManagement.Reconfigure` | yes |
 | Install/update the game (`Core/UpdateApplication`) | `Core.AppManagement.UpdateApplication` | yes |
-| Start/stop the app | `Core.AppManagement.*` | yes |
-| **Write instance settings (`Core/SetConfig`, `Core/SetConfigs`)** | **`Settings.*`** | **often not** |
-| Delete an instance | `ADS.InstanceManagement.DeleteInstances` | rarely |
-| Read user/role info | `Core.UserManagement.ViewUserInfo` | rarely |
+| Start/stop/restart the app, read and write console | `Core.AppManagement.*` | yes |
+| File manager, including SFTP | `FileManager.FileManager.*` | yes |
+| Delete an instance | `ADS.InstanceManagement.DeleteInstances` | yes |
+| **Write instance settings (`Core/SetConfig`, `Core/SetConfigs`)** | **`Settings.*`** | **no** |
+| Read user/role info | `Core.UserManagement.ViewUserInfo` | no |
 
 The `Settings.*` gap is the one that bites. It means a freshly created server runs on its template
 defaults and the values an operator actually cares about — server password, admin/owner name, world
@@ -302,22 +303,20 @@ signals this badly: it returns a bare `false` rather than an error, so this serv
 into a real failure that names the likely cause and tells you to retry with `Core/SetConfig`, which
 does report AMP's reason.
 
-To check a node before depending on it, rather than discovering the gap halfway through:
+Call `amp_permissions` to see what the account actually holds, before planning work that depends on
+it. That reads the effective permission list `Core/Login` returns, already resolved across every role
+the account belongs to, and it is the only source worth trusting. The two obvious alternatives both
+mislead:
 
-```bash
-amp_call Core/CurrentSessionHasPermission {"PermissionNode": "Settings.GenericModule.Meta.*"}
-```
-
-**This answers only for the session it runs on.** Run against a managed instance it reports on that
-instance's context, so controller-scoped `ADS.*` nodes come back `false` even when the controller
-session plainly holds them — `ADS.InstanceManagement.CreateInstance` reads `false` from a managed
-session on an account that creates instances successfully. Do not take a `false` there as proof the
-account lacks an ADS permission; the only reliable evidence for those is whether the controller call
-itself succeeds.
-
-The role checkboxes in AMP's web panel are also not a reliable read of effective permissions: a role
-can show a node as unchecked while the account still performs the action through another role or an
-inherited grant. Trust the permission list returned by `Core/Login`, or observed behaviour.
+- **`Core/CurrentSessionHasPermission` answers only for the session it runs on.** Run against a
+  managed instance it reports that instance's context, so controller-scoped `ADS.*` nodes come back
+  `false` even when the account plainly holds them. On this deployment
+  `ADS.InstanceManagement.CreateInstance` reads `false` from a managed session on an account that
+  creates instances successfully.
+- **The role checkboxes in AMP's web panel do not show the union.** Each role's editor shows only
+  what that role contributes, so an account in several roles can show a node unchecked everywhere
+  and still hold it. Two separate role dumps from this deployment showed
+  `ADS.InstanceManagement.DeleteInstances` as unchecked while `Core/Login` reports it as granted.
 
 Permission denials raised through `amp_call` carry a `[permissions]` hint naming the node to grant.
 Granting is a super-admin action in AMP's Configuration > Role Management.
