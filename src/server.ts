@@ -2102,16 +2102,31 @@ server.registerTool(
     });
 
     const result = await callAdsMethod("CreateInstance", body);
-    const task = args.wait ?? true ? await waitForControllerTask(result, args.waitTimeoutMs) : null;
 
     // AMP decides which instances a session may see when that session logs in, so
     // the session that just created this instance still cannot see it. Drop the
     // session (keeping the credentials) so the next call re-logs in and finds it.
+    // This runs in a finally because AMP's create task routinely outlives the wait
+    // timeout: the instance exists either way, and skipping the refresh on the slow
+    // path would leave it invisible in exactly the case that needs the refresh most.
     // Creating an instance is not a reason to lose the caller's current selection,
     // so put it back; its managed session is re-established on the next call.
-    const selectedBefore = managedInstance;
-    resetConnectionState();
-    managedInstance = selectedBefore;
+    // AMP accepted the create before the wait began, so a wait timeout means "still
+    // provisioning", not "failed". Reporting it as an error sends callers hunting for
+    // a problem that does not exist, or worse, creating the instance a second time.
+    let task: unknown = null;
+    let taskTimedOut = "";
+    try {
+      if (args.wait ?? true) task = await waitForControllerTask(result, args.waitTimeoutMs);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!/^Timed out waiting for AMP task/.test(message)) throw error;
+      taskTimedOut = message;
+    } finally {
+      const selectedBefore = managedInstance;
+      resetConnectionState();
+      managedInstance = selectedBefore;
+    }
 
     return textResult({
       policyGroup,
@@ -2124,6 +2139,12 @@ server.registerTool(
       result,
       task,
       note: `The MCP policy forces this instance into display group "${policyGroup}". The AMP session was refreshed so this instance is visible to the other tools.`,
+      ...(taskTimedOut
+        ? {
+            taskTimedOut:
+              `${taskTimedOut} AMP accepted the create before this wait started, so the instance almost certainly exists and is still provisioning. Do NOT create it again. Check with amp_instances, and raise waitTimeoutMs if you want this tool to wait longer.`,
+          }
+        : {}),
       ...(autoConfigure
         ? {}
         : {
