@@ -319,6 +319,33 @@ not missing, it is simply not one of that instance's nodes. Open the game instan
 (Configuration > Role Management inside its own panel) and the group appears. It is the same role
 being edited; each instance only contributes its own nodes to the tree it renders.
 
+### Automating the grant
+
+Clicking through each new instance's panel defeats the point of an API, and it is avoidable.
+`Core/SetAMPRolePermission` exists on the instance and takes the node directly, so `amp_grant_app_settings`
+routes the grant to the instance for you:
+
+```bash
+amp_grant_app_settings {"role": "mcp-user", "nodes": ["Settings.Meta.GenericModule"], "instance": "Necesse03"}
+```
+
+This needs a one-time bootstrap that a super admin performs from the **controller** panel, where the
+nodes are visible: grant the automation role `Core.RoleManagement.ViewRoles` and
+`Core.RoleManagement.EditRolePermissions`. After that every future instance can be granted its own
+settings nodes through the API, with no web UI step.
+
+**Understand what that bootstrap means.** A role that can edit role permissions can grant itself
+anything, so in AMP terms the account becomes equivalent to a super admin, and the least-privilege
+setup above stops being a real boundary. `amp_grant_app_settings` narrows the blast radius by
+refusing every node that is not an application setting — `Settings.Core.*` (AMP's own security,
+webserver and login configuration) and every non-`Settings` family such as `Core.RoleManagement.*`,
+`ADS.*` and `Instances.*` are rejected. That is a guardrail against mistakes, not against an
+attacker: anyone holding the credentials can call `Core/SetAMPRolePermission` directly and bypass
+this wrapper. If that trade is not one you want, leave the bootstrap ungranted and tick the settings
+group by hand once per instance instead.
+
+Permissions are read at login, so call `amp_clear_session` after a grant before relying on it.
+
 | App type | Grant | Covers |
 | --- | --- | --- |
 | Template-driven games (`GenericModule`: Necesse, most SteamCMD titles) | `Settings.Meta.GenericModule` | world name, MOTD, server password, owner, player limit, PvP/gameplay values — every setting from the app's config manifest |
