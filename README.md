@@ -95,13 +95,19 @@ You can also provide `AMP_SESSION_ID`, but `amp_login` or `amp_login_from_env` i
 
 ## Bundled Skill: guided game server setup
 
-`skills/amp-game-server-setup/` is a Claude Code skill that walks an agent through creating a game
-server on AMP: it interviews the user (basic or advanced depth, every value skippable), picks free
-ports, and then follows the ordering AMP actually requires — create auto-configured, move ports,
-install the app, and only then write settings. It carries the failure modes documented in this
-README so an agent does not have to rediscover them: `autoConfigure: false` producing an unmanageable
-instance, settings nodes not existing until the app is installed, `SetConfigs` returning a bare
-`false`, and stale sessions.
+`skills/amp-game-server-setup/` is a Claude Code skill for creating and reconfiguring game servers
+on AMP. Its shape comes from AMP's central constraint: an app's settings do not exist until the app
+is installed, so the work splits into a first phase that gathers only what a shell needs (game, name,
+ports) and a second that interviews from `Core/GetSettingsSpec` on the running instance — the real
+node list, with descriptions, defaults and legal values, for whichever of AMP's 240-odd apps this is.
+Questions are ranked by consequence, which also decides what a skipped answer means: housekeeping
+gets auto-filled, while passwords, admin names and world names are left unset and reported, because
+a password the user does not know is worse than an open port.
+
+It carries the failure modes documented in this README so an agent does not rediscover them the
+expensive way: `autoConfigure: false` producing an unmanageable instance, `ApplyInstanceConfiguration`
+silently dropping port changes, `SetConfigs` refusing a write with a bare `false`, settings
+permissions living only inside the instance, and stale sessions.
 
 Install it explicitly:
 
@@ -114,9 +120,10 @@ That copies the skill into `~/.claude/skills/` (override with `CLAUDE_SKILLS_DIR
 purpose: installing an MCP server should not quietly write into your Claude configuration, and a
 skill that appears without being asked for is a surprise even when it is a useful one.
 
-Per-game specifics live in `skills/amp-game-server-setup/references/` — `minecraft.md` for the
-`MinecraftModule` family and `generic-games.md` for the `GenericModule` templates that cover Necesse,
-Valheim, Palworld and most SteamCMD titles.
+`references/game-notes.md` holds only what a settings spec cannot express — Minecraft's EULA being
+the user's decision to make, which innocuous-looking fields load a different world, that Necesse has
+no difficulty setting to hunt for. Everything a spec can answer is read from the instance instead, so
+the skill works on apps that did not exist when it was written.
 
 ## Codex Skill
 
