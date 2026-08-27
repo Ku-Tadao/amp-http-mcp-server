@@ -296,6 +296,14 @@ a single game setting.
 | **Write instance settings (`Core/SetConfig`, `Core/SetConfigs`)** | **`Settings.*`** | **no** |
 | Read user/role info | `Core.UserManagement.ViewUserInfo` | no |
 
+**The file manager is not a way around a missing `Settings.*` grant.** Editing the app's config
+file directly looks like an obvious workaround, especially since `FileManager.FileManager.*` is
+usually granted in full, and it does not work: AMP holds exclusive control of the files named in a
+template's `ExclusiveControlFilenames` and rewrites them from its own config store every time the
+app starts. Verified on Necesse — `cfg/server.cfg` was edited through the file manager, the app
+restarted, and AMP had reverted every changed value. Configuration has to go through `Core/SetConfig`,
+which needs the grant.
+
 The `Settings.*` gap is the one that bites. It means a freshly created server runs on its template
 defaults and the values an operator actually cares about — server password, admin/owner name, world
 name, MOTD, slot count — have to be set from the AMP web UI by a super admin. `Core/SetConfigs`
