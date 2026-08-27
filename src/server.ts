@@ -646,8 +646,10 @@ function permissionHint(context: string, message: string) {
   const settingNode = /modify setting '([^']+)'/i.exec(message)?.[1];
   const required = findMethodMeta(moduleName ?? "", methodName ?? "")?.RequiredPermissions ?? [];
 
+  // A setting's permission node is its own node prefixed with "Settings.", so the
+  // denial can name exactly what to tick rather than gesturing at Settings.*.
   const needs = settingNode
-    ? `The AMP user's role needs the Settings.* node covering "${settingNode}" (writing instance settings is a separate grant from starting/updating the app).`
+    ? `The AMP user's role needs Settings.${settingNode}, or the parent Settings.${settingNode.split(".").slice(0, -1).join(".")} to cover the whole group (writing instance settings is a separate grant from starting/updating the app).`
     : required.length
       ? `The AMP user's role needs ${required.join(" and ")}.`
       : "The AMP user's role is missing a permission node for this call.";
@@ -1645,13 +1647,18 @@ server.registerTool(
 
     return textResult({
       username: loginCredentials.username || null,
-      canWriteInstanceSettings: hasPermission("Settings.GenericModule.Meta"),
+      // Game settings live under Settings.Meta.<Module> for template-driven apps and
+      // Settings.<Module> for native ones, so report both rather than guess a module.
+      canWriteGameSettings: {
+        "Settings.Meta.GenericModule": hasPermission("Settings.Meta.GenericModule"),
+        "Settings.MinecraftModule": hasPermission("Settings.MinecraftModule"),
+      },
       granted: globalGrants,
       instanceGrantCount: instanceGrants.length,
       ...(includeInstanceGrants ? { instanceGrants } : {}),
       ...(nodes?.length ? { checked: Object.fromEntries(nodes.map((node) => [node, hasPermission(node)])) } : {}),
       note:
-        "A node absent from this list is not granted. Settings.* is commonly missing, which blocks Core/SetConfig while leaving start/stop/update working; only an AMP super admin can grant it.",
+        "A node absent from this list is not granted. Settings.* is commonly missing, which blocks Core/SetConfig while leaving start/stop/update working; only an AMP super admin can grant it. A setting's permission node is the setting's own node prefixed with \"Settings.\", and Core/GetPermissionsSpec on an instance lists the exact tree for the app it runs.",
     });
   },
 );
@@ -2459,8 +2466,12 @@ function checkDiagnosticMessages() {
     "Core/SetConfig",
     "The current user does not have permission to modify setting 'Meta.GenericModule.world'.",
   );
-  if (!settingDenial.includes("Meta.GenericModule.world") || !settingDenial.includes("super admin")) {
-    throw new Error("Setting-level permission denials no longer name the setting and the fix.");
+  // A setting's permission node is the setting node prefixed with "Settings.".
+  if (!settingDenial.includes("Settings.Meta.GenericModule.world") || !settingDenial.includes("parent Settings.Meta.GenericModule ")) {
+    throw new Error("Setting denials no longer name the exact permission node and its parent group.");
+  }
+  if (!settingDenial.includes("super admin")) {
+    throw new Error("Setting denials no longer say who can grant the permission.");
   }
   if (permissionHint("Core/GetStatus", "The specified instance is not running") !== "") {
     throw new Error("permissionHint fires on errors that are not permission denials.");

@@ -296,6 +296,28 @@ a single game setting.
 | **Write instance settings (`Core/SetConfig`, `Core/SetConfigs`)** | **`Settings.*`** | **no** |
 | Read user/role info | `Core.UserManagement.ViewUserInfo` | no |
 
+### Which `Settings.*` nodes a game instance needs
+
+A setting's permission node is the setting's own node prefixed with `Settings.`, so
+`Meta.GenericModule.world` needs `Settings.Meta.GenericModule.world`. Grant the parent to cover a
+whole group. `Core/GetPermissionsSpec`, which requires no permissions, prints the exact tree for
+whatever app an instance runs — ask the instance rather than guessing, because the family differs by
+module:
+
+| App type | Grant | Covers |
+| --- | --- | --- |
+| Template-driven games (`GenericModule`: Necesse, most SteamCMD titles) | `Settings.Meta.GenericModule` | world name, MOTD, server password, owner, player limit, PvP/gameplay values — every setting from the app's config manifest |
+| Minecraft | `Settings.MinecraftModule.Minecraft`, `.Game`, `.Limits` | MOTD, level name, seed, view distance; difficulty, gamemode, PvP, whitelist; max players |
+| Minecraft, JVM tuning | `Settings.MinecraftModule.Java` | heap size, Java version |
+| Mods via Steam Workshop | `Settings.steamcmdplugin.SteamWorkshop` | workshop item IDs |
+| Backup policy | `Settings.LocalFileBackupPlugin.Limits` | count, size caps, compression |
+| Sleep/idle behaviour | `Settings.GenericModule.Limits` or `Settings.MinecraftModule.Limits` | sleep mode, retry count |
+
+For the day-to-day job of configuring a game server, the first row is the one that matters. On a
+`GenericModule` app, `Settings.Meta.GenericModule` alone unblocks everything an operator normally
+touches. Nothing under `Settings.Core.*` is needed for game administration — that group is AMP's own
+security, webserver and login configuration, and is best left ungranted.
+
 **The file manager is not a way around a missing `Settings.*` grant.** Editing the app's config
 file directly looks like an obvious workaround, especially since `FileManager.FileManager.*` is
 usually granted in full, and it does not work: AMP holds exclusive control of the files named in a
