@@ -93,6 +93,31 @@ If you run this from Codex, you can put the same values under `[mcp_servers.amp.
 
 You can also provide `AMP_SESSION_ID`, but `amp_login` or `amp_login_from_env` is usually cleaner because the server stores the session in memory and redacts it from tool output.
 
+## Bundled Skill: guided game server setup
+
+`skills/amp-game-server-setup/` is a Claude Code skill that walks an agent through creating a game
+server on AMP: it interviews the user (basic or advanced depth, every value skippable), picks free
+ports, and then follows the ordering AMP actually requires — create auto-configured, move ports,
+install the app, and only then write settings. It carries the failure modes documented in this
+README so an agent does not have to rediscover them: `autoConfigure: false` producing an unmanageable
+instance, settings nodes not existing until the app is installed, `SetConfigs` returning a bare
+`false`, and stale sessions.
+
+Install it explicitly:
+
+```bash
+npm run install-skill
+```
+
+That copies the skill into `~/.claude/skills/` (override with `CLAUDE_SKILLS_DIR`, overwrite with
+`-- --force`), then restart Claude Code. It is a command rather than a `postinstall` hook on
+purpose: installing an MCP server should not quietly write into your Claude configuration, and a
+skill that appears without being asked for is a surprise even when it is a useful one.
+
+Per-game specifics live in `skills/amp-game-server-setup/references/` — `minecraft.md` for the
+`MinecraftModule` family and `generic-games.md` for the `GenericModule` templates that cover Necesse,
+Valheim, Palworld and most SteamCMD titles.
+
 ## Codex Skill
 
 This repo includes a Codex skill at `.agents/skills/amp-mcp`. It teaches Codex how to use the friendly AMP MCP tools, diagnose missing environment/policy setup, avoid treating `amp_api_spec` as a raw AMP module, and keep operations inside the configured policy group.

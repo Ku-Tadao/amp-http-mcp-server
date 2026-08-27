@@ -10,6 +10,7 @@
     "build": "tsc",
     "dev": "tsx src/server.ts",
     "start": "node dist/server.js",
+    "install-skill": "node scripts/install-skill.mjs",
     "test": "npm run build && node dist/server.js --self-test"
   },
   "keywords": [],
