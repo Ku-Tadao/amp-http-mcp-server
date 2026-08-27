@@ -56,8 +56,10 @@ let loginCredentials = {
   token: process.env.AMP_TOKEN ?? "",
 };
 let cachedSpec: AmpSpec = fallbackSpec as AmpSpec;
-// Effective permissions for the logged-in account, as returned by Core/Login.
+// Effective permissions for the logged-in account, as returned by Core/Login on the
+// controller, and per instance because instance-scoped grants differ from it.
 let grantedPermissions: string[] = [];
+const managedPermissions = new Map<string, string[]>();
 let policyEnabled = process.env.AMP_POLICY_ENABLED !== "false";
 let policyGroup = process.env.AMP_POLICY_GROUP ?? "AI";
 const policyLocked = process.env.AMP_POLICY_LOCKED !== "false";
@@ -205,6 +207,7 @@ function resetConnectionState(clearControllerSession = true) {
   clearAuthRetry(controllerAuthRetry);
   managedInstance = null;
   managedSessions.clear();
+  managedPermissions.clear();
   managedLoginPromises.clear();
   managedAuthRetries.clear();
   managedSpecs.clear();
@@ -418,6 +421,11 @@ async function ensureManagedSession(instance: AmpInstance, timeoutMs = defaultMa
         }
         if (managedSessions.has(id)) {
           managedAuthRetries.delete(id);
+          // An instance resolves permissions for itself, and its answer differs from
+          // the controller's: a template role can grant Settings.Meta.* on every
+          // instance while the controller login never lists it. Keep the instance's
+          // own list so permission questions are answered where they are decided.
+          managedPermissions.set(id, readPermissions(result));
           return;
         }
         throw new AmpAuthenticationRejectedError("AMP accepted managed Core/Login but returned no session ID.");
@@ -1703,29 +1711,45 @@ server.registerTool(
       "Report what this AMP account is actually allowed to do, from the effective permission list Core/Login returns. Use it before planning work that depends on a permission, and after any permission denial. This is the authoritative answer: it is resolved across every role the account belongs to, unlike AMP's per-role checkboxes in the web panel, and unlike Core/CurrentSessionHasPermission which answers only for the scope of the session it runs on (controller-scoped ADS.* nodes read false from a managed-instance session even when the account holds them). Pass nodes to test specific permissions.",
     annotations: { title: "Show effective AMP permissions", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     inputSchema: z.object({
-      nodes: z.array(z.string()).optional().describe("Permission nodes to test, for example Settings.GenericModule.Meta.* or ADS.InstanceManagement.DeleteInstances."),
+      nodes: z.array(z.string()).optional().describe("Permission nodes to test, for example Settings.Meta.GenericModule or ADS.InstanceManagement.DeleteInstances."),
+      instance: z.string().optional().describe("Report the permissions this account holds ON that instance. Defaults to the selected instance when there is one. Instance-scoped grants, notably game settings from a template role, appear here and NOT in the controller's list, so always ask about the instance you intend to act on."),
+      scope: z.enum(["auto", "controller", "instance"]).optional().describe("auto (default) uses the instance when one is selected or named, else the controller."),
       includeInstanceGrants: z.boolean().optional().describe("Include the per-instance Instances.<id>.* grants, which are numerous. Defaults to false."),
     }),
   },
-  async ({ nodes, includeInstanceGrants }) => {
+  async ({ nodes, instance, scope, includeInstanceGrants }) => {
     await ensureSession("Core", "GetAPISpec");
-    const instanceGrants = grantedPermissions.filter((node) => node.startsWith("Instances."));
-    const globalGrants = grantedPermissions.filter((node) => !node.startsWith("Instances."));
+
+    // Ask the instance whenever the caller named or selected one. The controller's
+    // list omits instance-scoped grants entirely, so answering from it produces
+    // confident false negatives for exactly the settings people care about.
+    const wantInstance = scope === "instance" || (scope !== "controller" && (instance || managedInstance));
+    const target = wantInstance ? await resolvePolicyInstance(instance) : null;
+    if (target) await ensureManagedSession(target);
+
+    const effective = target ? managedPermissions.get(instanceIdOf(target)) ?? [] : grantedPermissions;
+    const holds = (node: string) =>
+      effective.some((granted) => granted === node || (granted.endsWith(".*") && node.startsWith(granted.slice(0, -1))));
+
+    const instanceGrants = effective.filter((node) => node.startsWith("Instances."));
+    const globalGrants = effective.filter((node) => !node.startsWith("Instances."));
 
     return textResult({
       username: loginCredentials.username || null,
+      scope: target ? `instance: ${instanceLabel(target)}` : "controller",
       // Game settings live under Settings.Meta.<Module> for template-driven apps and
       // Settings.<Module> for native ones, so report both rather than guess a module.
       canWriteGameSettings: {
-        "Settings.Meta.GenericModule": hasPermission("Settings.Meta.GenericModule"),
-        "Settings.MinecraftModule": hasPermission("Settings.MinecraftModule"),
+        "Settings.Meta.GenericModule": holds("Settings.Meta.GenericModule"),
+        "Settings.MinecraftModule": holds("Settings.MinecraftModule"),
       },
       granted: globalGrants,
       instanceGrantCount: instanceGrants.length,
       ...(includeInstanceGrants ? { instanceGrants } : {}),
-      ...(nodes?.length ? { checked: Object.fromEntries(nodes.map((node) => [node, hasPermission(node)])) } : {}),
-      note:
-        "A node absent from this list is not granted. Settings.* is commonly missing, which blocks Core/SetConfig while leaving start/stop/update working; only an AMP super admin can grant it. A setting's permission node is the setting's own node prefixed with \"Settings.\", and Core/GetPermissionsSpec on an instance lists the exact tree for the app it runs.",
+      ...(nodes?.length ? { checked: Object.fromEntries(nodes.map((node) => [node, holds(node)])) } : {}),
+      note: target
+        ? "These are the permissions this account holds on this instance, which is where instance calls are authorised. They can differ from the controller's list in both directions: a template role can grant Settings.Meta.* here and not there, and applying a template role can also remove Core.AppManagement.* here while the controller still lists it."
+        : "Controller scope. Instance-scoped grants such as game settings are NOT listed here; pass instance to ask the instance that will actually authorise the call.",
     });
   },
 );
