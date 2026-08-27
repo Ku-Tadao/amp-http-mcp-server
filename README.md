@@ -319,11 +319,27 @@ not missing, it is simply not one of that instance's nodes. Open the game instan
 (Configuration > Role Management inside its own panel) and the group appears. It is the same role
 being edited; each instance only contributes its own nodes to the tree it renders.
 
-### Automating the grant
+### Template roles are the real fix for "every new instance needs this again"
 
-Clicking through each new instance's panel defeats the point of an API, and it is avoidable.
-`Core/SetAMPRolePermission` exists on the instance and takes the node directly, so `amp_grant_app_settings`
-routes the grant to the instance for you:
+If the goal is that new instances simply come with their settings permissions already in place, the
+answer is an AMP **template role**, not this API. Assign a template role its permissions inside one
+instance of a game, and those permissions carry to other instances automatically. Two caveats:
+template roles need AMP's Advanced edition or above, and game-specific metaconfig only transfers to
+instances of the *same* game — generic abilities like start/stop/read-console carry everywhere.
+
+Template roles are configured in the web UI and have **no API surface**: across the entire spec the
+only role methods are `Core.CreateRole/DeleteRole/RenameRole/SetAMPRolePermission/SetAMPUserRoleMembership`
+plus the `GetRole*` readers, and every method named "Template" belongs to `ADSModule` and refers to
+*deployment* templates for provisioning instances. `CreateRole`'s `AsCommonRole` flag is a different
+feature again: a global role is one that exists in both ADS and individual instances, rather than
+only inside an instance. It does not propagate permissions between instances.
+
+### Granting through the API instead
+
+Where template roles are unavailable, or to fix up instances that already exist, or to cover the
+first instance of a new game whose metaconfig has nothing to propagate from yet,
+`Core/SetAMPRolePermission` exists on the instance and takes the node directly, so
+`amp_grant_app_settings` routes the grant to the instance for you:
 
 ```bash
 amp_grant_app_settings {"role": "mcp-user", "nodes": ["Settings.Meta.GenericModule"], "instance": "Necesse03"}
