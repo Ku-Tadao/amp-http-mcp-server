@@ -302,7 +302,22 @@ A setting's permission node is the setting's own node prefixed with `Settings.`,
 `Meta.GenericModule.world` needs `Settings.Meta.GenericModule.world`. Grant the parent to cover a
 whole group. `Core/GetPermissionsSpec`, which requires no permissions, prints the exact tree for
 whatever app an instance runs — ask the instance rather than guessing, because the family differs by
-module:
+module.
+
+**Grant these from the instance's own panel, not the controller's.** Each AMP instance publishes
+permission nodes only for the modules it loads, and the ADS controller does not run a game, so game
+settings are absent from its role editor entirely. Comparing the two trees on the reference
+deployment:
+
+| | `Settings.*` groups offered |
+| --- | --- |
+| Controller (ADS01) | `Core`, `ADSModule`, `FileManagerPlugin`, `EmailSenderPlugin`, `WebRequestPlugin`, `WebhookPlugin`, `steamcmdplugin` |
+| A Necesse instance | the same, minus `ADSModule`, plus **`Meta`**, **`GenericModule`**, `LocalFileBackupPlugin`, `AnalyticsPlugin`, `RCONPlugin` |
+
+So `Settings.Meta.GenericModule` cannot be ticked from the controller's Role Management page — it is
+not missing, it is simply not one of that instance's nodes. Open the game instance itself
+(Configuration > Role Management inside its own panel) and the group appears. It is the same role
+being edited; each instance only contributes its own nodes to the tree it renders.
 
 | App type | Grant | Covers |
 | --- | --- | --- |
