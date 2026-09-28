@@ -77,7 +77,11 @@ Moving an instance's ports shows the mix in one task:
 2. `ADSModule/SetInstanceNetworkInfo` with the GUID as `InstanceId`,
    `PortMappings: { "<ProvisionNodeName>": <port>, … }` and `mustStop: true`. This updates the app's
    own port settings too; no separate `Core/SetConfig` is needed. `ApplyInstanceConfiguration`
-   accepts port arguments and ignores them, so don't use it for ports.
+   accepts port arguments and ignores them, so don't use it for ports. AMP treats an omitted
+   `ApplicationIP` as "clear it", after which the container fails to start with error code 125
+   ("must provide a non-empty container host IP to publish"); an omitted `AdvertisedAddress` is
+   wiped too. `amp_call` fills both from the instance's current values when you leave them out, so
+   pass them only to change them.
 3. The `mustStop` stop is asynchronous and leaves the instance stopped. Wait for
    `ADSModule/GetInstanceStatuses` to show `Running: false`, then `amp_start_instance`. Starting
    before the stop settles can return `alreadyRunning` and leave it stopped.

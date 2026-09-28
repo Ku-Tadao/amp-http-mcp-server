@@ -77,7 +77,7 @@ is not logged in or has expired.
 - `ADSModule/RestartInstance(InstanceName: String) → ActionResult`
 - `ADSModule/Servers(Data: JObject, RealIP: IPAddress) → JSONRawResponse`
 - `ADSModule/SetInstanceConfig(InstanceName: String, SettingNode: String, Value: String) → ActionResult` [ADS.InstanceManagement.Reconfigure]
-- `ADSModule/SetInstanceNetworkInfo(InstanceId: Guid, PortMappings: Dictionary<String, Int32>, ApplicationIP?: String, mustStop?: Boolean, AdvertisedAddress?: String, AdvertisedAddressIncludesPort?: Boolean) → ActionResult` [ADS.InstanceManagement.Reconfigure]
+- `ADSModule/SetInstanceNetworkInfo(InstanceId: Guid, PortMappings: Dictionary<String, Int32>, ApplicationIP?: String, mustStop?: Boolean, AdvertisedAddress?: String, AdvertisedAddressIncludesPort?: Boolean) → ActionResult` [ADS.InstanceManagement.Reconfigure] — an omitted ApplicationIP/AdvertisedAddress is cleared, not kept (empty ApplicationIP → container start fails with code 125); amp_call fills them from GetInstance.
 - `ADSModule/SetInstanceSuspended(InstanceName: String, Suspended: Boolean, SuspendReason?: String) → ActionResult` [ADS.InstanceManagement.SuspendInstances]
 - `ADSModule/StartAllInstances(TargetADSInstance: Guid) → ActionResult` [ADS.InstanceManagement.StartInstances]
 - `ADSModule/StartInstance(InstanceName: String) → ActionResult`
