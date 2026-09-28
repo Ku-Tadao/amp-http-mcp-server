@@ -56,7 +56,9 @@ Order matters; each step is what makes the next possible.
    `ProvisionNodeName` keys. `ADSModule/SetInstanceNetworkInfo` instead requires the instance's GUID
    as `InstanceId` — take it from `amp_create_instance` or `amp_instances`, never pass the instance
    name — plus those keys and `mustStop: true`. `ApplyInstanceConfiguration` accepts port arguments
-   and silently ignores them. The stop is asynchronous and leaves the instance stopped: wait for
+   and silently ignores them. Leave `ApplicationIP` out unless you mean to change it: `amp_call`
+   keeps the current binding, whereas an empty one stops the container from starting (error code
+   125, "non-empty container host IP"). The stop is asynchronous and leaves the instance stopped: wait for
    `ADSModule/GetInstanceStatuses` to report `Running: false`, then `amp_start_instance` and wait for
    `Running: true`. Calling start before the stop settles can incorrectly return `alreadyRunning`.
 3. **Install.** `amp_use_instance`, then `Core/UpdateApplication`. Minutes, not seconds — watch

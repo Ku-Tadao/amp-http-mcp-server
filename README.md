@@ -459,6 +459,12 @@ The `PortMappings` keys are the `ProvisionNodeName` values from `GetInstanceNetw
 `ADSModule/ApplyInstanceConfiguration` accepts port arguments and silently does not apply them —
 use `SetInstanceNetworkInfo`.
 
+AMP clears any `SetInstanceNetworkInfo` argument you omit rather than keeping it. An empty
+`ApplicationIP` leaves the container unable to start ("must provide a non-empty container host IP to
+publish", error code 125), so `amp_call` reads the instance first and fills `ApplicationIP`,
+`AdvertisedAddress` and `AdvertisedAddressIncludesPort` from their current values when they are
+missing.
+
 ### Configure after creation, not during it
 
 AMP decides a lot for itself while provisioning and quietly discards the rest. `FriendlyName` is the

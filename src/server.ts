@@ -253,6 +253,24 @@ function assertSetterApplied(moduleName: string, methodName: string, result: unk
   );
 }
 
+// ADSModule/SetInstanceNetworkInfo treats an omitted ApplicationIP as "clear it", not
+// "keep it": the container is then published with an empty host IP and fails to start
+// ("must provide a non-empty container host IP to publish", error code 125). The
+// advertised address is wiped the same way. Fill whatever the caller left out from the
+// instance's current record.
+function keepNetworkDefaults(body: Record<string, unknown>, instance: AmpRecord | null) {
+  const args = asRecord(instance?.DeploymentArgs) ?? {};
+  const filled = { ...body };
+  filled.ApplicationIP ??= instance?.ApplicationIP || args["GenericModule.App.ApplicationIPBinding"] || "0.0.0.0";
+  if (filled.AdvertisedAddress === undefined && args["Core.AMP.AdvertisedAddress"]) {
+    filled.AdvertisedAddress = args["Core.AMP.AdvertisedAddress"];
+  }
+  if (filled.AdvertisedAddressIncludesPort === undefined && args["Core.AMP.AdvertisedAddressIncludesPort"] !== undefined) {
+    filled.AdvertisedAddressIncludesPort = String(args["Core.AMP.AdvertisedAddressIncludesPort"]).toLowerCase() === "true";
+  }
+  return filled;
+}
+
 async function resolveMethodMeta(moduleName: string, methodName: string, instance: AmpInstance | null) {
   if (instance) {
     try {
@@ -2444,7 +2462,10 @@ server.registerTool(
     if (requiresConfirmation(moduleName, methodName) && !confirm) {
       throw new Error(`Refusing to call state-changing method ${moduleName}/${methodName} without confirm: true.`);
     }
-    const body = normalizeParams(meta, params ?? {});
+    let body = normalizeParams(meta, params ?? {});
+    if (moduleName === "ADSModule" && methodName === "SetInstanceNetworkInfo") {
+      body = keepNetworkDefaults(body, asRecord(await ampRequest("ADSModule", "GetInstance", { InstanceId: body.InstanceId })));
+    }
     const policyBody = await assertPolicyAllows(moduleName, methodName, body, routeInstance);
     const result = await ampRequest(moduleName, methodName, policyBody, routeInstance);
     await updateManagedInstance(moduleName, methodName, policyBody, result);
@@ -2500,6 +2521,16 @@ function checkPathHandling() {
     throw new Error("Malformed base64 was accepted.");
   } catch (error) {
     if (!(error instanceof Error) || !error.message.includes("valid base64")) throw error;
+  }
+  const kept = keepNetworkDefaults({ InstanceId: "x" }, {
+    ApplicationIP: null,
+    DeploymentArgs: { "GenericModule.App.ApplicationIPBinding": "10.0.0.5", "Core.AMP.AdvertisedAddress": "play.example.com", "Core.AMP.AdvertisedAddressIncludesPort": "false" },
+  });
+  if (kept.ApplicationIP !== "10.0.0.5" || kept.AdvertisedAddress !== "play.example.com" || kept.AdvertisedAddressIncludesPort !== false) {
+    throw new Error(`keepNetworkDefaults did not carry the instance's network settings over: ${JSON.stringify(kept)}`);
+  }
+  if (keepNetworkDefaults({ ApplicationIP: "1.2.3.4" }, null).ApplicationIP !== "1.2.3.4" || keepNetworkDefaults({}, null).ApplicationIP !== "0.0.0.0") {
+    throw new Error("keepNetworkDefaults overrode an explicit ApplicationIP or left it empty.");
   }
   const root = splitAmpPath("server.properties");
   if (root.dir !== "" || root.name !== "server.properties") {
