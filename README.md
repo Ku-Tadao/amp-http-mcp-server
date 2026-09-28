@@ -526,6 +526,16 @@ to replace it with AMP's much smaller anonymous discovery catalog. On the audite
 the live AMP 2.8.0.4 catalog exactly matches the fallback: 7 modules and 205 methods. AMP's actual
 interactive API browser is `/api`; `/apiNote` is the normal panel shell, not API documentation.
 
+To update the fallback after an AMP upgrade, save a HAR of `/api` from the browser's dev tools while
+logged in, then run:
+
+```bash
+node scripts/extract-api-spec.mjs api/your-panel.har
+```
+
+It rewrites `src/amp-api-spec.json` and the skill's `references/api-reference.md` from the largest
+`GetAPISpec` response in the capture. The HAR contains your session ID; `*.har` is gitignored.
+
 The controller spec does not list an application instance's own modules. After selecting an
 instance with `amp_use_instance`, pass:
 
