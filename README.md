@@ -127,9 +127,7 @@ the skill works on apps that did not exist when it was written.
 
 ## Codex Skill
 
-This repo includes a Codex skill at `.agents/skills/amp-mcp`. It teaches Codex how to use the friendly AMP MCP tools, diagnose missing environment/policy setup, avoid treating `amp_api_spec` as a raw AMP module, and keep operations inside the configured policy group.
-
-When working inside this repository, Codex can discover the repo-scoped skill automatically. To make it available globally on your machine, copy or install `.agents/skills/amp-mcp` into:
+`skills/amp-mcp` teaches an agent to operate AMP through this MCP: the friendly tools, connection and policy diagnostics, and raw `amp_call` usage backed by `references/api-reference.md`, a one-line-per-method listing of the controller API. `npm run install-skill` installs it for Claude Code along with the setup skill. For Codex, copy `skills/amp-mcp` into:
 
 ```text
 %USERPROFILE%\.agents\skills\amp-mcp

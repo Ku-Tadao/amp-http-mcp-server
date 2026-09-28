@@ -77,6 +77,6 @@ ${Object.entries(preLogin).flatMap(([module, methods]) => Object.keys(methods).m
 ` : ""}
 ${lines.join("\n")}`;
 
-const out = path.join(root, ".agents", "skills", "amp-mcp", "references", "api-reference.md");
+const out = path.join(root, "skills", "amp-mcp", "references", "api-reference.md");
 writeFileSync(out, doc);
 console.log(`${count(full)} methods (${version}) -> src/amp-api-spec.json, ${path.relative(root, out)}`);
